@@ -367,6 +367,50 @@ void NRed::probePhoenix()
                initialResp == kSMUFWResponseSuccess ? "true" : "false");
     }
 
+    if (complete && checkKernelArgument("-NRedPhoenixIMUProbe")) {
+        // Phoenix IP discovery reports GC 11.0.1 segment 1 at DWORD
+        // 0xA000. These offsets are from AMD's public GC 11 register
+        // headers. Observe whether platform firmware left IMU/RLC state
+        // usable before attempting any firmware upload or reset transition.
+        static constexpr UInt32 GC_BASE1 = 0xA000;
+        static constexpr UInt32 GFX_IMU_C2PMSG_16 = GC_BASE1 + 0x4010;
+        static constexpr UInt32 GFX_IMU_C2PMSG_ACCESS_CTRL0 = GC_BASE1 + 0x4040;
+        static constexpr UInt32 GFX_IMU_SCRATCH_0 = GC_BASE1 + 0x4068;
+        static constexpr UInt32 GFX_IMU_CORE_CTRL = GC_BASE1 + 0x40B6;
+        static constexpr UInt32 GFX_IMU_GFX_RESET_CTRL = GC_BASE1 + 0x40BC;
+        // GC 11.0.1 uses 0x4E7E rather than the generic 0x4E82.
+        static constexpr UInt32 RLC_RLCS_BOOTLOAD_STATUS = GC_BASE1 + 0x4E7E;
+
+        UInt32 c2pmsg16 = 0, accessCtrl0 = 0, scratch0 = 0;
+        UInt32 coreCtrl = 0, resetCtrl = 0, bootloadStatus = 0;
+        const bool imuComplete = read(GFX_IMU_C2PMSG_16, c2pmsg16)
+                              && read(GFX_IMU_C2PMSG_ACCESS_CTRL0, accessCtrl0)
+                              && read(GFX_IMU_SCRATCH_0, scratch0)
+                              && read(GFX_IMU_CORE_CTRL, coreCtrl)
+                              && read(GFX_IMU_GFX_RESET_CTRL, resetCtrl)
+                              && read(RLC_RLCS_BOOTLOAD_STATUS, bootloadStatus);
+        if (imuComplete) {
+            this->setProp32("NRed,phoenix-imu-c2pmsg16", c2pmsg16);
+            this->setProp32("NRed,phoenix-imu-access-ctrl0", accessCtrl0);
+            this->setProp32("NRed,phoenix-imu-scratch0", scratch0);
+            this->setProp32("NRed,phoenix-imu-core-ctrl", coreCtrl);
+            this->setProp32("NRed,phoenix-imu-gfx-reset-ctrl", resetCtrl);
+            this->setProp32("NRed,phoenix-rlc-bootload-status", bootloadStatus);
+            this->iGPU->setProperty("NRed,phoenix-imu-running",
+                                   (coreCtrl & 1U) == 0 && (resetCtrl & 0x1FU) == 0x1FU);
+            this->iGPU->setProperty("NRed,phoenix-rlc-bootload-complete",
+                                   (bootloadStatus & 0x80000000U) != 0);
+            SYSLOG("NRed", "Phoenix IMU read-only probe: c2pmsg16=0x%08X access=0x%08X scratch0=0x%08X core=0x%08X reset=0x%08X RLC=0x%08X running=%s bootload=%s",
+                   c2pmsg16, accessCtrl0, scratch0, coreCtrl, resetCtrl, bootloadStatus,
+                   ((coreCtrl & 1U) == 0 && (resetCtrl & 0x1FU) == 0x1FU) ? "true" : "false",
+                   (bootloadStatus & 0x80000000U) != 0 ? "true" : "false");
+        }
+        else {
+            SYSLOG("NRed", "Phoenix IMU read-only probe registers exceed BAR5 length=0x%llX",
+                   mmio->getLength());
+        }
+    }
+
     if (complete && checkKernelArgument("-NRedPhoenixGFXHUBInit")) {
         // Passthrough did not execute enough of the platform POST to populate
         // GFXHUB's FB copy registers. Mirror MMHUB's validated 512 MiB window.
