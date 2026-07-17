@@ -279,6 +279,34 @@ void NRed::probePhoenix()
                mmio->getLength());
     }
 
+    if (complete && checkKernelArgument("-NRedPhoenixPSPProbe")) {
+        // IP discovery v3 reports MP0 base segment 1 at DWORD 0x16000.
+        // These C2PMSG offsets come from AMD's public MP 13.0.4 register
+        // headers. This stage observes PSP boot/ring state without writes.
+        static constexpr UInt32 MP0_BASE1  = 0x16000;
+        static constexpr UInt32 C2PMSG_35  = MP0_BASE1 + 0x63;
+        static constexpr UInt32 C2PMSG_64  = MP0_BASE1 + 0x80;
+        static constexpr UInt32 C2PMSG_67  = MP0_BASE1 + 0x83;
+        static constexpr UInt32 C2PMSG_81  = MP0_BASE1 + 0x91;
+        UInt32 msg35 = 0, msg64 = 0, msg67 = 0, msg81 = 0;
+        const bool pspComplete = read(C2PMSG_35, msg35) && read(C2PMSG_64, msg64)
+                              && read(C2PMSG_67, msg67) && read(C2PMSG_81, msg81);
+        if (pspComplete) {
+            this->setProp32("NRed,phoenix-psp-c2pmsg35", msg35);
+            this->setProp32("NRed,phoenix-psp-c2pmsg64", msg64);
+            this->setProp32("NRed,phoenix-psp-c2pmsg67", msg67);
+            this->setProp32("NRed,phoenix-psp-c2pmsg81", msg81);
+            this->iGPU->setProperty("NRed,phoenix-psp-bootloader-ready", (msg35 & 0x80000000U) != 0);
+            this->iGPU->setProperty("NRed,phoenix-psp-sos-alive", msg81 != 0);
+            SYSLOG("NRed", "Phoenix PSP read-only probe: C2PMSG[35]=0x%08X [64]=0x%08X [67]=0x%08X [81]=0x%08X ready=%s sos=%s",
+                   msg35, msg64, msg67, msg81, (msg35 & 0x80000000U) != 0 ? "true" : "false",
+                   msg81 != 0 ? "true" : "false");
+        }
+        else {
+            SYSLOG("NRed", "Phoenix PSP read-only probe registers exceed BAR5 length=0x%llX", mmio->getLength());
+        }
+    }
+
     if (complete && checkKernelArgument("-NRedPhoenixIPDiscovery")) {
         // AMD's public discovery format places a 10 KiB blob 64 KiB below
         // the end of VRAM when DRIVER_SCRATCH_2 does not provide an override.
@@ -429,17 +457,28 @@ void NRed::probePhoenix()
                                                          | (static_cast<UInt32>(ipRevision) << 8)
                                                          | (static_cast<UInt32>(ipVariant) << 4)
                                                          | ipSubRevision;
-                                char versionKey[48], fullVersionKey[56], variantKey[48], subRevisionKey[56], baseKey[48];
+                                char versionKey[48], fullVersionKey[56], variantKey[48], subRevisionKey[56], baseCountKey[52], baseKey[48];
                                 snprintf(versionKey, sizeof(versionKey), "NRed,phoenix-ip-%u-%u-version", hwID, instance);
                                 snprintf(fullVersionKey, sizeof(fullVersionKey), "NRed,phoenix-ip-%u-%u-full-version", hwID, instance);
                                 snprintf(variantKey, sizeof(variantKey), "NRed,phoenix-ip-%u-%u-variant", hwID, instance);
                                 snprintf(subRevisionKey, sizeof(subRevisionKey), "NRed,phoenix-ip-%u-%u-sub-revision", hwID, instance);
-                                snprintf(baseKey, sizeof(baseKey), "NRed,phoenix-ip-%u-%u-base0", hwID, instance);
+                                snprintf(baseCountKey, sizeof(baseCountKey), "NRed,phoenix-ip-%u-%u-base-count", hwID, instance);
                                 this->setProp32(versionKey, version);
                                 this->setProp32(fullVersionKey, fullVersion);
                                 this->setProp32(variantKey, ipVariant);
                                 this->setProp32(subRevisionKey, ipSubRevision);
-                                this->setProp32(baseKey, base0);
+                                this->setProp32(baseCountKey, baseCount);
+                                // Phoenix uses multiple register segments per IP. In
+                                // particular MP0/PSP status registers are not based at
+                                // segment zero, so retain every v3 32-bit base.
+                                if (!addresses64Bit) {
+                                    for (UInt8 baseIndex = 0; baseIndex < baseCount; baseIndex += 1) {
+                                        UInt32 baseAddress = 0;
+                                        if (!blob32(ipOffset + 8 + (static_cast<size_t>(baseIndex) * sizeof(UInt32)), baseAddress)) { break; }
+                                        snprintf(baseKey, sizeof(baseKey), "NRed,phoenix-ip-%u-%u-base%u", hwID, instance, baseIndex);
+                                        this->setProp32(baseKey, baseAddress);
+                                    }
+                                }
                                 SYSLOG("NRed", "Phoenix IP[%u]: hw=%u instance=%u version=%u.%u.%u variant=%u subrev=%u full=0x%08X bases=%u base0=0x%08X",
                                        i, hwID, instance, ipMajor, ipMinor, ipRevision, ipVariant, ipSubRevision,
                                        fullVersion, baseCount, base0);
