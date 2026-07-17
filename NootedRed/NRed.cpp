@@ -415,10 +415,13 @@ void NRed::probePhoenix()
 
             const UInt64 ringAddress = VRAM_BASE + RING_OFFSET;
             UInt32 response = initialMailbox;
+            const bool previousRing = (initialMailbox & 0xFFFFU) == 0
+                                   && (initialMailbox & 0x000F0000U) == KM_RING_COMMAND;
             bool recovered = true;
-            if ((initialMailbox & 0xFFFFU) != 0) {
-                // A guest reboot leaves PSP running. Recover from a stale
-                // failed/repeated create before publishing a fresh ring.
+            if ((initialMailbox & 0xFFFFU) != 0 || previousRing) {
+                // A guest reboot leaves PSP and its ring write pointer alive.
+                // Destroy stale/error and healthy prior rings alike so every
+                // macOS boot starts with a known zero write pointer.
                 ptr[C2PMSG_64] = DESTROY_RINGS_COMMAND;
                 OSSynchronizeIO();
                 IOSleep(20);
@@ -432,10 +435,8 @@ void NRed::probePhoenix()
                 }
             }
 
-            const bool existingRing = recovered && (response & READY_MASK) == READY_VALUE
-                                   && (response & 0x000F0000U) == KM_RING_COMMAND;
-            bool created = existingRing;
-            if (recovered && !existingRing) {
+            bool created = false;
+            if (recovered) {
                 ptr[C2PMSG_69] = static_cast<UInt32>(ringAddress);
                 ptr[C2PMSG_70] = static_cast<UInt32>(ringAddress >> 32);
                 ptr[C2PMSG_71] = RING_SIZE;
@@ -457,9 +458,9 @@ void NRed::probePhoenix()
             this->setProp32("NRed,phoenix-psp-ring-response", response);
             this->setProp32("NRed,phoenix-psp-ring-wptr", writePointer);
             this->setProp32("NRed,phoenix-psp-ring-offset", static_cast<UInt32>(RING_OFFSET));
-            SYSLOG("NRed", "Phoenix PSP KM ring setup: address=0x%llX size=0x%X initial=0x%08X response=0x%08X wptr=0x%08X recovered=%s reused=%s created=%s",
+            SYSLOG("NRed", "Phoenix PSP KM ring setup: address=0x%llX size=0x%X initial=0x%08X response=0x%08X wptr=0x%08X recovered=%s prior=%s created=%s",
                    ringAddress, RING_SIZE, initialMailbox, response, writePointer, recovered ? "true" : "false",
-                   existingRing ? "true" : "false", created ? "true" : "false");
+                   previousRing ? "true" : "false", created ? "true" : "false");
         }
         else {
             this->iGPU->setProperty("NRed,phoenix-psp-ring-created", false);
@@ -527,6 +528,7 @@ void NRed::probePhoenix()
             UInt32 writePointer = 0;
             read(C2PMSG_67, writePointer);
             const bool queryValid = consumed && responseStatus == 0;
+            this->iGPU->setProperty("NRed,phoenix-psp-ring-transport-valid", consumed);
             this->iGPU->setProperty("NRed,phoenix-psp-ring-query-valid", queryValid);
             this->setProp32("NRed,phoenix-psp-ring-query-fence", fence[0]);
             this->setProp32("NRed,phoenix-psp-ring-query-status", responseStatus);
@@ -542,6 +544,83 @@ void NRed::probePhoenix()
                    queryVram != nullptr ? "mapped" : "unmapped", ringStatus);
         }
         if (queryVram != nullptr) { queryVram->release(); }
+    }
+
+    if (complete && checkKernelArgument("-NRedPhoenixPSPTMRSetup")) {
+        // Reserve a naturally aligned 4 MiB Trusted Memory Region in visible
+        // VRAM. Phoenix requires both its GPU MC and APU system-physical view.
+        static constexpr UInt64 VRAM_BASE = 0x8000000000ULL;
+        static constexpr UInt64 VRAM_PHYSICAL_OFFSET = 0x480000000ULL;
+        static constexpr UInt64 TMR_OFFSET = 0x0C000000ULL;
+        static constexpr UInt32 TMR_SIZE = 0x00400000;
+        static constexpr UInt64 RING_OFFSET = 0x0E000000ULL;
+        static constexpr UInt64 COMMAND_OFFSET = RING_OFFSET + 0x1000;
+        static constexpr UInt64 FENCE_OFFSET = RING_OFFSET + 0x2000;
+        static constexpr UInt32 MP0_BASE1 = 0x16000;
+        static constexpr UInt32 C2PMSG_67 = MP0_BASE1 + 0x83;
+        static constexpr UInt32 GFX_CMD_ID_SETUP_TMR = 0x5;
+        static constexpr UInt32 FRAME_DWORDS = 16;
+        static constexpr UInt32 RING_DWORDS = 0x1000 / sizeof(UInt32);
+        static constexpr UInt32 RESPONSE_DWORD = 864 / sizeof(UInt32);
+        auto* const tmrVram = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
+                                                                      kIOMapInhibitCache | kIOMapAnywhere);
+        UInt32 writePointer = 0;
+        if (tmrVram != nullptr && FENCE_OFFSET + 0x1000 <= tmrVram->getLength()
+            && read(C2PMSG_67, writePointer) && writePointer < RING_DWORDS
+            && (writePointer % FRAME_DWORDS) == 0) {
+            auto* const base = reinterpret_cast<volatile UInt32*>(tmrVram->getVirtualAddress());
+            auto* const ring = base + (RING_OFFSET / sizeof(UInt32));
+            auto* const command = base + (COMMAND_OFFSET / sizeof(UInt32));
+            auto* const fence = base + (FENCE_OFFSET / sizeof(UInt32));
+            for (UInt32 i = 0; i < 0x1000 / sizeof(UInt32); i += 1) {
+                command[i] = 0;
+                fence[i] = 0;
+            }
+            const UInt64 tmrAddress = VRAM_BASE + TMR_OFFSET;
+            const UInt64 tmrPhysical = VRAM_PHYSICAL_OFFSET + TMR_OFFSET;
+            command[2] = GFX_CMD_ID_SETUP_TMR;
+            command[7] = static_cast<UInt32>(tmrAddress);
+            command[8] = static_cast<UInt32>(tmrAddress >> 32);
+            command[9] = TMR_SIZE;
+            command[10] = 2; // virt_phy_addr
+            command[11] = static_cast<UInt32>(tmrPhysical);
+            command[12] = static_cast<UInt32>(tmrPhysical >> 32);
+
+            auto* const frame = ring + writePointer;
+            for (UInt32 i = 0; i < FRAME_DWORDS; i += 1) { frame[i] = 0; }
+            const UInt64 commandAddress = VRAM_BASE + COMMAND_OFFSET;
+            const UInt64 fenceAddress = VRAM_BASE + FENCE_OFFSET;
+            frame[0] = static_cast<UInt32>(commandAddress);
+            frame[1] = static_cast<UInt32>(commandAddress >> 32);
+            frame[3] = static_cast<UInt32>(fenceAddress);
+            frame[4] = static_cast<UInt32>(fenceAddress >> 32);
+            frame[5] = 2;
+            OSSynchronizeIO();
+            const UInt32 nextWritePointer = (writePointer + FRAME_DWORDS) % RING_DWORDS;
+            ptr[C2PMSG_67] = nextWritePointer;
+            OSSynchronizeIO();
+
+            bool consumed = false;
+            for (UInt32 attempt = 0; attempt < 2000; attempt += 1) {
+                OSSynchronizeIO();
+                if (fence[0] == 2) { consumed = true; break; }
+                IOSleep(1);
+            }
+            const UInt32 status = command[RESPONSE_DWORD];
+            const bool setup = consumed && status == 0;
+            this->iGPU->setProperty("NRed,phoenix-psp-tmr-setup", setup);
+            this->setProp32("NRed,phoenix-psp-tmr-status", status);
+            this->setProp32("NRed,phoenix-psp-tmr-fence", fence[0]);
+            this->setProp32("NRed,phoenix-psp-tmr-offset", static_cast<UInt32>(TMR_OFFSET));
+            SYSLOG("NRed", "Phoenix PSP TMR setup: mc=0x%llX pa=0x%llX size=0x%X fence=0x%08X status=0x%08X setup=%s",
+                   tmrAddress, tmrPhysical, TMR_SIZE, fence[0], status, setup ? "true" : "false");
+        }
+        else {
+            this->iGPU->setProperty("NRed,phoenix-psp-tmr-setup", false);
+            SYSLOG("NRed", "Phoenix PSP TMR setup precondition failed: BAR0=%s wptr=0x%08X",
+                   tmrVram != nullptr ? "mapped" : "unmapped", writePointer);
+        }
+        if (tmrVram != nullptr) { tmrVram->release(); }
     }
 
     if (complete && checkKernelArgument("-NRedPhoenixIPDiscovery")) {
