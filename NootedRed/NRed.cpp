@@ -583,9 +583,12 @@ void NRed::probePhoenix()
             command[7] = static_cast<UInt32>(tmrAddress);
             command[8] = static_cast<UInt32>(tmrAddress >> 32);
             command[9] = TMR_SIZE;
-            command[10] = 2; // virt_phy_addr
-            command[11] = static_cast<UInt32>(tmrPhysical);
-            command[12] = static_cast<UInt32>(tmrPhysical >> 32);
+            // VFIO does not expose the host stolen-memory physical address to
+            // the guest IOMMU. Supply only the valid GPU MC address; PSP can
+            // resolve the VRAM backing internally.
+            command[10] = 0;
+            command[11] = 0;
+            command[12] = 0;
 
             auto* const frame = ring + writePointer;
             for (UInt32 i = 0; i < FRAME_DWORDS; i += 1) { frame[i] = 0; }
@@ -613,6 +616,7 @@ void NRed::probePhoenix()
             this->setProp32("NRed,phoenix-psp-tmr-status", status);
             this->setProp32("NRed,phoenix-psp-tmr-fence", fence[0]);
             this->setProp32("NRed,phoenix-psp-tmr-offset", static_cast<UInt32>(TMR_OFFSET));
+            this->iGPU->setProperty("NRed,phoenix-psp-tmr-virtual-only", true);
             SYSLOG("NRed", "Phoenix PSP TMR setup: mc=0x%llX pa=0x%llX size=0x%X fence=0x%08X status=0x%08X setup=%s",
                    tmrAddress, tmrPhysical, TMR_SIZE, fence[0], status, setup ? "true" : "false");
         }
