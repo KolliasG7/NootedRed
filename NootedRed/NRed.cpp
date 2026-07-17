@@ -307,6 +307,38 @@ void NRed::probePhoenix()
         }
     }
 
+    if (complete && checkKernelArgument("-NRedPhoenixGMCProbe")) {
+        // Read the currently programmed GPU physical framebuffer window from
+        // both GFXHUB 3.0 and MMHUB 3.0.1. Values are in 16 MiB units.
+        static constexpr UInt32 GC_BASE0 = 0x1260;
+        static constexpr UInt32 GCMC_VM_FB_LOCATION_BASE = GC_BASE0 + 0x1688;
+        static constexpr UInt32 GCMC_VM_FB_LOCATION_TOP  = GC_BASE0 + 0x1689;
+        static constexpr UInt32 MMHUB_BASE1 = 0x1A000;
+        static constexpr UInt32 MMMC_VM_FB_OFFSET        = MMHUB_BASE1 + 0x08D7;
+        static constexpr UInt32 MMMC_VM_FB_LOCATION_BASE = MMHUB_BASE1 + 0x08EC;
+        static constexpr UInt32 MMMC_VM_FB_LOCATION_TOP  = MMHUB_BASE1 + 0x08ED;
+        UInt32 gfxBase = 0, gfxTop = 0, mmOffset = 0, mmBase = 0, mmTop = 0;
+        const bool gmcComplete = read(GCMC_VM_FB_LOCATION_BASE, gfxBase)
+                              && read(GCMC_VM_FB_LOCATION_TOP, gfxTop)
+                              && read(MMMC_VM_FB_OFFSET, mmOffset)
+                              && read(MMMC_VM_FB_LOCATION_BASE, mmBase)
+                              && read(MMMC_VM_FB_LOCATION_TOP, mmTop);
+        if (gmcComplete) {
+            gfxBase &= 0x00FFFFFFU; gfxTop &= 0x00FFFFFFU;
+            mmOffset &= 0x00FFFFFFU; mmBase &= 0x00FFFFFFU; mmTop &= 0x00FFFFFFU;
+            this->setProp32("NRed,phoenix-gfxhub-fb-base-16m", gfxBase);
+            this->setProp32("NRed,phoenix-gfxhub-fb-top-16m", gfxTop);
+            this->setProp32("NRed,phoenix-mmhub-fb-offset-16m", mmOffset);
+            this->setProp32("NRed,phoenix-mmhub-fb-base-16m", mmBase);
+            this->setProp32("NRed,phoenix-mmhub-fb-top-16m", mmTop);
+            SYSLOG("NRed", "Phoenix GMC read-only probe: GFXHUB FB=[0x%06X..0x%06X] MMHUB FB=[0x%06X..0x%06X] offset=0x%06X (16MiB units)",
+                   gfxBase, gfxTop, mmBase, mmTop, mmOffset);
+        }
+        else {
+            SYSLOG("NRed", "Phoenix GMC read-only probe registers exceed BAR5 length=0x%llX", mmio->getLength());
+        }
+    }
+
     if (complete && checkKernelArgument("-NRedPhoenixIPDiscovery")) {
         // AMD's public discovery format places a 10 KiB blob 64 KiB below
         // the end of VRAM when DRIVER_SCRATCH_2 does not provide an override.
