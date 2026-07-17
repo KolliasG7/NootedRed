@@ -414,6 +414,9 @@ void NRed::probePhoenix()
                                 const UInt8 ipMajor = blob[ipOffset + 4];
                                 const UInt8 ipMinor = blob[ipOffset + 5];
                                 const UInt8 ipRevision = blob[ipOffset + 6];
+                                const UInt8 versionExtension = blob[ipOffset + 7];
+                                const UInt8 ipSubRevision = ipVersion >= 3 ? (versionExtension & 0x0FU) : 0;
+                                const UInt8 ipVariant = ipVersion >= 3 ? (versionExtension >> 4) : 0;
                                 const size_t nextOffset = ipOffset + 8 + (static_cast<size_t>(baseCount) * addressSize);
                                 if (nextOffset > binarySize) { break; }
 
@@ -421,13 +424,25 @@ void NRed::probePhoenix()
                                 if (baseCount > 0) { blob32(ipOffset + 8, base0); }
                                 const UInt32 version = (static_cast<UInt32>(ipMajor) << 16)
                                                      | (static_cast<UInt32>(ipMinor) << 8) | ipRevision;
-                                char versionKey[48], baseKey[48];
+                                const UInt32 fullVersion = (static_cast<UInt32>(ipMajor) << 24)
+                                                         | (static_cast<UInt32>(ipMinor) << 16)
+                                                         | (static_cast<UInt32>(ipRevision) << 8)
+                                                         | (static_cast<UInt32>(ipVariant) << 4)
+                                                         | ipSubRevision;
+                                char versionKey[48], fullVersionKey[56], variantKey[48], subRevisionKey[56], baseKey[48];
                                 snprintf(versionKey, sizeof(versionKey), "NRed,phoenix-ip-%u-%u-version", hwID, instance);
+                                snprintf(fullVersionKey, sizeof(fullVersionKey), "NRed,phoenix-ip-%u-%u-full-version", hwID, instance);
+                                snprintf(variantKey, sizeof(variantKey), "NRed,phoenix-ip-%u-%u-variant", hwID, instance);
+                                snprintf(subRevisionKey, sizeof(subRevisionKey), "NRed,phoenix-ip-%u-%u-sub-revision", hwID, instance);
                                 snprintf(baseKey, sizeof(baseKey), "NRed,phoenix-ip-%u-%u-base0", hwID, instance);
                                 this->setProp32(versionKey, version);
+                                this->setProp32(fullVersionKey, fullVersion);
+                                this->setProp32(variantKey, ipVariant);
+                                this->setProp32(subRevisionKey, ipSubRevision);
                                 this->setProp32(baseKey, base0);
-                                SYSLOG("NRed", "Phoenix IP[%u]: hw=%u instance=%u version=%u.%u.%u bases=%u base0=0x%08X",
-                                       i, hwID, instance, ipMajor, ipMinor, ipRevision, baseCount, base0);
+                                SYSLOG("NRed", "Phoenix IP[%u]: hw=%u instance=%u version=%u.%u.%u variant=%u subrev=%u full=0x%08X bases=%u base0=0x%08X",
+                                       i, hwID, instance, ipMajor, ipMinor, ipRevision, ipVariant, ipSubRevision,
+                                       fullVersion, baseCount, base0);
                                 ipOffset = nextOffset;
                             }
                         }
