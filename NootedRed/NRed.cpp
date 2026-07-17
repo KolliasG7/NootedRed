@@ -448,6 +448,80 @@ void NRed::probePhoenix()
         if (ringVram != nullptr) { ringVram->release(); }
     }
 
+    if (complete && checkKernelArgument("-NRedPhoenixPSPRingQuery")) {
+        // Submit BOOTCFG_CMD_GET as a non-destructive end-to-end validation of
+        // PSP ring memory, command memory, fence writes, and mailbox wptr.
+        static constexpr UInt64 VRAM_BASE = 0x8000000000ULL;
+        static constexpr UInt64 RING_OFFSET = 0x0E000000ULL;
+        static constexpr UInt64 COMMAND_OFFSET = RING_OFFSET + 0x1000;
+        static constexpr UInt64 FENCE_OFFSET = RING_OFFSET + 0x2000;
+        static constexpr UInt32 MP0_BASE1 = 0x16000;
+        static constexpr UInt32 C2PMSG_64 = MP0_BASE1 + 0x80;
+        static constexpr UInt32 C2PMSG_67 = MP0_BASE1 + 0x83;
+        static constexpr UInt32 GFX_CMD_ID_BOOT_CFG = 0x22;
+        static constexpr UInt32 BOOTCFG_CMD_GET = 2;
+        static constexpr UInt32 FRAME_DWORDS = 16;
+        static constexpr UInt32 RESPONSE_DWORD = 864 / sizeof(UInt32);
+        static constexpr UInt32 BOOTCFG_RESPONSE_DWORD = (864 + 64) / sizeof(UInt32);
+        auto* const queryVram = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
+                                                                        kIOMapInhibitCache | kIOMapAnywhere);
+        UInt32 ringStatus = 0;
+        if (queryVram != nullptr && FENCE_OFFSET + 0x1000 <= queryVram->getLength()
+            && read(C2PMSG_64, ringStatus) && (ringStatus & 0x8000FFFFU) == 0x80000000U) {
+            auto* const base = reinterpret_cast<volatile UInt32*>(queryVram->getVirtualAddress());
+            auto* const ring = base + (RING_OFFSET / sizeof(UInt32));
+            auto* const command = base + (COMMAND_OFFSET / sizeof(UInt32));
+            auto* const fence = base + (FENCE_OFFSET / sizeof(UInt32));
+            for (UInt32 i = 0; i < 0x1000 / sizeof(UInt32); i += 1) {
+                command[i] = 0;
+                fence[i] = 0;
+            }
+            command[2] = GFX_CMD_ID_BOOT_CFG;
+            command[8] = BOOTCFG_CMD_GET;
+
+            const UInt64 commandAddress = VRAM_BASE + COMMAND_OFFSET;
+            const UInt64 fenceAddress = VRAM_BASE + FENCE_OFFSET;
+            for (UInt32 i = 0; i < FRAME_DWORDS; i += 1) { ring[i] = 0; }
+            ring[0] = static_cast<UInt32>(commandAddress);
+            ring[1] = static_cast<UInt32>(commandAddress >> 32);
+            ring[3] = static_cast<UInt32>(fenceAddress);
+            ring[4] = static_cast<UInt32>(fenceAddress >> 32);
+            ring[5] = 1;
+            OSSynchronizeIO();
+            ptr[C2PMSG_67] = FRAME_DWORDS;
+            OSSynchronizeIO();
+
+            bool consumed = false;
+            for (UInt32 attempt = 0; attempt < 2000; attempt += 1) {
+                OSSynchronizeIO();
+                if (fence[0] == 1) {
+                    consumed = true;
+                    break;
+                }
+                IOSleep(1);
+            }
+            const UInt32 responseStatus = command[RESPONSE_DWORD];
+            const UInt32 bootConfig = command[BOOTCFG_RESPONSE_DWORD];
+            UInt32 writePointer = 0;
+            read(C2PMSG_67, writePointer);
+            const bool queryValid = consumed && responseStatus == 0;
+            this->iGPU->setProperty("NRed,phoenix-psp-ring-query-valid", queryValid);
+            this->setProp32("NRed,phoenix-psp-ring-query-fence", fence[0]);
+            this->setProp32("NRed,phoenix-psp-ring-query-status", responseStatus);
+            this->setProp32("NRed,phoenix-psp-ring-query-boot-config", bootConfig);
+            this->setProp32("NRed,phoenix-psp-ring-query-wptr", writePointer);
+            SYSLOG("NRed", "Phoenix PSP BOOT_CFG query: consumed=%s fence=0x%08X status=0x%08X config=0x%08X wptr=0x%08X valid=%s",
+                   consumed ? "true" : "false", fence[0], responseStatus, bootConfig, writePointer,
+                   queryValid ? "true" : "false");
+        }
+        else {
+            this->iGPU->setProperty("NRed,phoenix-psp-ring-query-valid", false);
+            SYSLOG("NRed", "Phoenix PSP BOOT_CFG query precondition failed: BAR0=%s ring=0x%08X",
+                   queryVram != nullptr ? "mapped" : "unmapped", ringStatus);
+        }
+        if (queryVram != nullptr) { queryVram->release(); }
+    }
+
     if (complete && checkKernelArgument("-NRedPhoenixIPDiscovery")) {
         // AMD's public discovery format places a 10 KiB blob 64 KiB below
         // the end of VRAM when DRIVER_SCRATCH_2 does not provide an override.
