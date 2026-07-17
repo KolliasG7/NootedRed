@@ -548,10 +548,10 @@ void NRed::probePhoenix()
     }
 
     if (complete && checkKernelArgument("-NRedPhoenixPSPTMRSetup")) {
-        // Reserve Phoenix's TOC-sized 64 MiB Trusted Memory Region. Native
-        // Linux selects offset 0x18000000; it is naturally 64 MiB aligned.
+        // Reserve Phoenix's TOC-sized 64 MiB Trusted Memory Region. Keep it
+        // naturally aligned and inside VFIO's visible 256 MiB BAR0 aperture.
         static constexpr UInt64 VRAM_BASE = 0x8000000000ULL;
-        static constexpr UInt64 TMR_OFFSET = 0x18000000ULL;
+        static constexpr UInt64 TMR_OFFSET = 0x08000000ULL;
         static constexpr UInt32 TMR_SIZE = 0x04000000;
         static constexpr UInt64 RING_OFFSET = 0x0E000000ULL;
         static constexpr UInt64 COMMAND_OFFSET = RING_OFFSET + 0x1000;
