@@ -20,6 +20,7 @@ jobs:
           xcodebuild -version
       - name: Build matching Lilu debug dependency
         run: |
+          ln -s ../MacKernelSDK Lilu/MacKernelSDK
           cd Lilu
           xcodebuild -jobs 1 -configuration Debug -arch x86_64 build
       - name: Build research release
