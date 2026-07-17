@@ -402,33 +402,54 @@ void NRed::probePhoenix()
         static constexpr UInt32 READY_MASK = 0x8000FFFFU;
         static constexpr UInt32 READY_VALUE = 0x80000000U;
         static constexpr UInt32 KM_RING_COMMAND = 2U << 16;
+        static constexpr UInt32 DESTROY_RINGS_COMMAND = 3U << 16;
         auto* const ringVram = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
                                                                        kIOMapInhibitCache | kIOMapAnywhere);
         UInt32 initialMailbox = 0;
         if (ringVram != nullptr && RING_OFFSET + RING_SIZE <= ringVram->getLength()
-            && read(C2PMSG_64, initialMailbox) && (initialMailbox & READY_MASK) == READY_VALUE) {
+            && read(C2PMSG_64, initialMailbox) && (initialMailbox & 0x80000000U) != 0) {
             auto* const ring = reinterpret_cast<volatile UInt32*>(
                 static_cast<UInt8*>(reinterpret_cast<void*>(ringVram->getVirtualAddress())) + RING_OFFSET);
             for (UInt32 i = 0; i < RING_SIZE / sizeof(UInt32); i += 1) { ring[i] = 0; }
             OSSynchronizeIO();
 
             const UInt64 ringAddress = VRAM_BASE + RING_OFFSET;
-            ptr[C2PMSG_69] = static_cast<UInt32>(ringAddress);
-            ptr[C2PMSG_70] = static_cast<UInt32>(ringAddress >> 32);
-            ptr[C2PMSG_71] = RING_SIZE;
-            OSSynchronizeIO();
-            ptr[C2PMSG_64] = KM_RING_COMMAND;
-            OSSynchronizeIO();
-            IOSleep(20);
-
-            UInt32 response = 0;
-            bool created = false;
-            for (UInt32 attempt = 0; attempt < 1000; attempt += 1) {
-                if (read(C2PMSG_64, response) && (response & READY_MASK) == READY_VALUE) {
-                    created = true;
-                    break;
+            UInt32 response = initialMailbox;
+            bool recovered = true;
+            if ((initialMailbox & 0xFFFFU) != 0) {
+                // A guest reboot leaves PSP running. Recover from a stale
+                // failed/repeated create before publishing a fresh ring.
+                ptr[C2PMSG_64] = DESTROY_RINGS_COMMAND;
+                OSSynchronizeIO();
+                IOSleep(20);
+                recovered = false;
+                for (UInt32 attempt = 0; attempt < 1000; attempt += 1) {
+                    if (read(C2PMSG_64, response) && (response & READY_MASK) == READY_VALUE) {
+                        recovered = true;
+                        break;
+                    }
+                    IOSleep(1);
                 }
-                IOSleep(1);
+            }
+
+            const bool existingRing = recovered && (response & READY_MASK) == READY_VALUE
+                                   && (response & 0x000F0000U) == KM_RING_COMMAND;
+            bool created = existingRing;
+            if (recovered && !existingRing) {
+                ptr[C2PMSG_69] = static_cast<UInt32>(ringAddress);
+                ptr[C2PMSG_70] = static_cast<UInt32>(ringAddress >> 32);
+                ptr[C2PMSG_71] = RING_SIZE;
+                OSSynchronizeIO();
+                ptr[C2PMSG_64] = KM_RING_COMMAND;
+                OSSynchronizeIO();
+                IOSleep(20);
+                for (UInt32 attempt = 0; attempt < 1000; attempt += 1) {
+                    if (read(C2PMSG_64, response) && (response & READY_MASK) == READY_VALUE) {
+                        created = true;
+                        break;
+                    }
+                    IOSleep(1);
+                }
             }
             UInt32 writePointer = 0;
             read(C2PMSG_67, writePointer);
@@ -436,8 +457,9 @@ void NRed::probePhoenix()
             this->setProp32("NRed,phoenix-psp-ring-response", response);
             this->setProp32("NRed,phoenix-psp-ring-wptr", writePointer);
             this->setProp32("NRed,phoenix-psp-ring-offset", static_cast<UInt32>(RING_OFFSET));
-            SYSLOG("NRed", "Phoenix PSP KM ring create: address=0x%llX size=0x%X initial=0x%08X response=0x%08X wptr=0x%08X created=%s",
-                   ringAddress, RING_SIZE, initialMailbox, response, writePointer, created ? "true" : "false");
+            SYSLOG("NRed", "Phoenix PSP KM ring setup: address=0x%llX size=0x%X initial=0x%08X response=0x%08X wptr=0x%08X recovered=%s reused=%s created=%s",
+                   ringAddress, RING_SIZE, initialMailbox, response, writePointer, recovered ? "true" : "false",
+                   existingRing ? "true" : "false", created ? "true" : "false");
         }
         else {
             this->iGPU->setProperty("NRed,phoenix-psp-ring-created", false);
