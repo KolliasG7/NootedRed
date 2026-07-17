@@ -412,6 +412,7 @@ void NRed::probePhoenix()
         }
     }
 
+    bool phoenixIMUFirmwareStreamed = false;
     if (complete && checkKernelArgument("-NRedPhoenixIMUDirectLoad")) {
         // Linux's direct GC 11 path loads IMU instruction and data RAM before
         // releasing reset or asking PMFW to enable GFX IMU. Keep those state
@@ -434,7 +435,7 @@ void NRed::probePhoenix()
         const bool imageValid = phoenix_gc_11_0_1_imu_len == IMAGE_SIZE
                              && DRAM_OFFSET + DRAM_SIZE <= phoenix_gc_11_0_1_imu_len;
         const bool cleanReset = read(GFX_IMU_CORE_CTRL, coreBefore) && (coreBefore & 1U) != 0;
-        bool loaded = false;
+        bool resetPreserved = false;
         UInt32 iAddr = ~0U, dAddr = ~0U, coreAfter = ~0U;
         if (imageValid && cleanReset) {
             ptr[GFX_IMU_I_RAM_ADDR] = 0;
@@ -453,18 +454,98 @@ void NRed::probePhoenix()
             }
             ptr[GFX_IMU_D_RAM_ADDR] = IMU_VERSION;
             OSSynchronizeIO();
-            loaded = read(GFX_IMU_I_RAM_ADDR, iAddr) && read(GFX_IMU_D_RAM_ADDR, dAddr)
-                  && read(GFX_IMU_CORE_CTRL, coreAfter)
-                  && iAddr == IMU_VERSION && dAddr == IMU_VERSION && (coreAfter & 1U) != 0;
+            // AMDGPU does not read either RAM address port back. Their ADDR
+            // fields are only 14 bits wide and Linux deliberately writes the
+            // full firmware version after streaming, so equality with the
+            // version is not a valid upload test. Preserve the observations
+            // as diagnostics and use the still-asserted CRESET as this
+            // stage's safety invariant. Starting the IMU is the functional
+            // validation in the independently gated stage below.
+            read(GFX_IMU_I_RAM_ADDR, iAddr);
+            read(GFX_IMU_D_RAM_ADDR, dAddr);
+            resetPreserved = read(GFX_IMU_CORE_CTRL, coreAfter) && (coreAfter & 1U) != 0;
+            phoenixIMUFirmwareStreamed = resetPreserved;
         }
-        this->iGPU->setProperty("NRed,phoenix-imu-direct-loaded", loaded);
+        this->iGPU->setProperty("NRed,phoenix-imu-direct-streamed", phoenixIMUFirmwareStreamed);
+        this->iGPU->setProperty("NRed,phoenix-imu-direct-reset-preserved", resetPreserved);
         this->setProp32("NRed,phoenix-imu-direct-i-addr", iAddr);
         this->setProp32("NRed,phoenix-imu-direct-d-addr", dAddr);
         this->setProp32("NRed,phoenix-imu-direct-core-before", coreBefore);
         this->setProp32("NRed,phoenix-imu-direct-core-after", coreAfter);
-        SYSLOG("NRed", "Phoenix IMU direct load: image=%s cleanReset=%s IAddr=0x%08X DAddr=0x%08X core=[0x%08X->0x%08X] loaded=%s",
+        SYSLOG("NRed", "Phoenix IMU direct load: image=%s cleanReset=%s IAddr=0x%08X DAddr=0x%08X core=[0x%08X->0x%08X] streamed=%s resetPreserved=%s",
                imageValid ? "valid" : "invalid", cleanReset ? "true" : "false", iAddr, dAddr,
-               coreBefore, coreAfter, loaded ? "true" : "false");
+               coreBefore, coreAfter, phoenixIMUFirmwareStreamed ? "true" : "false",
+               resetPreserved ? "true" : "false");
+    }
+
+    if (complete && checkKernelArgument("-NRedPhoenixIMUStart")) {
+        // Follow AMDGPU's APU sequence after the direct loader: configure the
+        // IMU mission-mode mailbox, release CRESET, then ask PMFW to power up
+        // graphics through EnableGfxImu. All waits are bounded so a failed
+        // experiment cannot wedge the macOS boot thread indefinitely.
+        static constexpr UInt32 GC_BASE1 = 0xA000;
+        static constexpr UInt32 GFX_IMU_C2PMSG_ACCESS_CTRL0 = GC_BASE1 + 0x4040;
+        static constexpr UInt32 GFX_IMU_C2PMSG_ACCESS_CTRL1 = GC_BASE1 + 0x4041;
+        static constexpr UInt32 GFX_IMU_SCRATCH_10 = GC_BASE1 + 0x4072;
+        static constexpr UInt32 GFX_IMU_CORE_CTRL = GC_BASE1 + 0x40B6;
+        static constexpr UInt32 GFX_IMU_GFX_RESET_CTRL = GC_BASE1 + 0x40BC;
+        static constexpr UInt32 MP1_BASE1 = 0x16000;
+        static constexpr UInt32 C2PMSG_66 = MP1_BASE1 + 0x282;
+        static constexpr UInt32 C2PMSG_82 = MP1_BASE1 + 0x292;
+        static constexpr UInt32 C2PMSG_90 = MP1_BASE1 + 0x29A;
+        static constexpr UInt32 ENABLE_GFX_IMU = 0x16;
+
+        UInt32 coreBefore = ~0U, coreAfter = ~0U, resetStatus = ~0U;
+        UInt32 smuResponse = 0, scratch10 = 0;
+        bool responseReady = false, resetReady = false;
+        const bool prerequisites = phoenixIMUFirmwareStreamed
+                                && read(GFX_IMU_CORE_CTRL, coreBefore)
+                                && (coreBefore & 1U) != 0;
+        if (prerequisites) {
+            ptr[GFX_IMU_C2PMSG_ACCESS_CTRL0] = 0x00FFFFFF;
+            ptr[GFX_IMU_C2PMSG_ACCESS_CTRL1] = 0x0000FFFF;
+            if (read(GFX_IMU_SCRATCH_10, scratch10)) {
+                ptr[GFX_IMU_SCRATCH_10] = scratch10 | 0x00010007;
+            }
+            ptr[GFX_IMU_CORE_CTRL] = coreBefore & ~1U;
+            OSSynchronizeIO();
+            read(GFX_IMU_CORE_CTRL, coreAfter);
+
+            // PMFW's mailbox was verified ready by the preceding probe.
+            ptr[C2PMSG_90] = kSMUFWResponseNoResponse;
+            ptr[C2PMSG_82] = 1;
+            ptr[C2PMSG_66] = ENABLE_GFX_IMU;
+            OSSynchronizeIO();
+            for (UInt32 attempt = 0; attempt < 100; attempt += 1) {
+                if (read(C2PMSG_90, smuResponse) && smuResponse != kSMUFWResponseNoResponse) {
+                    responseReady = true;
+                    break;
+                }
+                IOSleep(1);
+            }
+            if (responseReady && smuResponse == kSMUFWResponseSuccess) {
+                IOSleep(10);
+                for (UInt32 attempt = 0; attempt < 100; attempt += 1) {
+                    if (read(GFX_IMU_GFX_RESET_CTRL, resetStatus)
+                        && (resetStatus & 0x1FU) == 0x1FU) {
+                        resetReady = true;
+                        break;
+                    }
+                    IOSleep(1);
+                }
+            }
+        }
+        this->iGPU->setProperty("NRed,phoenix-imu-start-prerequisites", prerequisites);
+        this->iGPU->setProperty("NRed,phoenix-imu-start-smu-responded", responseReady);
+        this->iGPU->setProperty("NRed,phoenix-imu-start-reset-ready", resetReady);
+        this->setProp32("NRed,phoenix-imu-start-core-before", coreBefore);
+        this->setProp32("NRed,phoenix-imu-start-core-after", coreAfter);
+        this->setProp32("NRed,phoenix-imu-start-smu-response", smuResponse);
+        this->setProp32("NRed,phoenix-imu-start-reset-status", resetStatus);
+        SYSLOG("NRed", "Phoenix IMU start: prerequisites=%s core=[0x%08X->0x%08X] SMU=[responded=%s response=0x%08X] reset=[ready=%s status=0x%08X]",
+               prerequisites ? "true" : "false", coreBefore, coreAfter,
+               responseReady ? "true" : "false", smuResponse,
+               resetReady ? "true" : "false", resetStatus);
     }
 
     if (complete && checkKernelArgument("-NRedPhoenixGFXHUBInit")) {
