@@ -254,7 +254,7 @@ void NRed::probePhoenix()
         return;
     }
 
-    const auto* const ptr = reinterpret_cast<volatile const UInt32*>(mmio->getVirtualAddress());
+    auto* const ptr = reinterpret_cast<volatile UInt32*>(mmio->getVirtualAddress());
     const auto read = [mmio, ptr](const UInt32 reg, UInt32& value) -> bool {
         if ((static_cast<UInt64>(reg) * sizeof(UInt32)) >= mmio->getLength()) { return false; }
         value = ptr[reg];
@@ -277,6 +277,61 @@ void NRed::probePhoenix()
     else {
         SYSLOG("NRed", "Phoenix BAR5 is too small for the read-only discovery probe (length=0x%llX)",
                mmio->getLength());
+    }
+
+    if (complete && checkKernelArgument("-NRedPhoenixIPDiscovery")) {
+        // AMD's public discovery format places a 10 KiB blob 64 KiB below
+        // the end of VRAM when DRIVER_SCRATCH_2 does not provide an override.
+        // BAR0 exposes only the first 256 MiB in this VM, so use the stable
+        // MM_INDEX/MM_DATA aperture to read the header.  MM_INDEX and
+        // MM_INDEX_HI are address selectors; this never writes VRAM or a GPU
+        // engine register.
+        static constexpr UInt32 MM_INDEX              = 0x0;
+        static constexpr UInt32 MM_DATA               = 0x1;
+        static constexpr UInt32 MM_INDEX_HI           = 0x6;
+        static constexpr UInt64 DISCOVERY_TMR_OFFSET  = 64ULL << 10;
+        static constexpr UInt32 BINARY_SIGNATURE      = 0x28211407;
+        static constexpr UInt32 HEADER_DWORDS         = 16;
+
+        const UInt64 vramBytes = static_cast<UInt64>(vramSizeMiB) << 20;
+        if (vramBytes >= DISCOVERY_TMR_OFFSET) {
+            const UInt64 discoveryOffset = vramBytes - DISCOVERY_TMR_OFFSET;
+            UInt32 header[HEADER_DWORDS] {};
+            UInt32 currentHigh = ~0U;
+            for (UInt32 i = 0; i < HEADER_DWORDS; i += 1) {
+                const UInt64 position = discoveryOffset + (static_cast<UInt64>(i) * sizeof(UInt32));
+                const UInt32 high = static_cast<UInt32>(position >> 31);
+                ptr[MM_INDEX] = static_cast<UInt32>(position) | 0x80000000U;
+                if (high != currentHigh) {
+                    ptr[MM_INDEX_HI] = high;
+                    currentHigh = high;
+                }
+                OSSynchronizeIO();
+                header[i] = ptr[MM_DATA];
+            }
+
+            const auto* const bytes = reinterpret_cast<const UInt8*>(header);
+            const auto read16 = [bytes](const size_t offset) -> UInt16 {
+                return static_cast<UInt16>(bytes[offset])
+                     | static_cast<UInt16>(static_cast<UInt16>(bytes[offset + 1]) << 8);
+            };
+            const UInt16 major = read16(4);
+            const UInt16 minor = read16(6);
+            const UInt16 binarySize = read16(10);
+            const UInt16 tableCount = read16(12);
+
+            SYSLOG("NRed", "Phoenix IP discovery header: signature=0x%08X version=%u.%u size=%u tables=%u",
+                   header[0], major, minor, binarySize, tableCount);
+            this->setProp32("NRed,phoenix-discovery-signature", header[0]);
+            this->setProp32("NRed,phoenix-discovery-major", major);
+            this->setProp32("NRed,phoenix-discovery-minor", minor);
+            this->setProp32("NRed,phoenix-discovery-size", binarySize);
+            this->setProp32("NRed,phoenix-discovery-table-count", tableCount);
+            this->iGPU->setProperty("NRed,phoenix-discovery-header-valid", header[0] == BINARY_SIGNATURE);
+        }
+        else {
+            SYSLOG("NRed", "Phoenix IP discovery skipped because VRAM size is smaller than its reserved offset");
+        }
     }
     mmio->release();
 
