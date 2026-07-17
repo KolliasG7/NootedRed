@@ -214,11 +214,11 @@ void NRed::probePhoenix()
 {
     static constexpr char model[] = "AMD Radeon 780M (Phoenix experimental probe)";
     static constexpr char architecture[] = "GFX11.0.3";
-    static constexpr UInt8 probeVersion = 2;
+    static constexpr UInt32 probeVersion = 2;
 
-    this->iGPU->setProperty("model", model, sizeof(model));
-    this->iGPU->setProperty("NRed,phoenix-probe", &probeVersion, sizeof(probeVersion));
-    this->iGPU->setProperty("NRed,phoenix-architecture", architecture, sizeof(architecture));
+    this->iGPU->setProperty("model", model);
+    this->setProp32("NRed,phoenix-probe", probeVersion);
+    this->iGPU->setProperty("NRed,phoenix-architecture", architecture);
 
     SYSLOG("NRed", "Phoenix1 detected: device=0x%04X revision=0x%02X", this->deviceID, this->pciRevision);
     for (UInt8 bar = 0; bar < 6; bar += 1) {
