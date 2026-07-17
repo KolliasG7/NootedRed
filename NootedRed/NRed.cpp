@@ -386,6 +386,68 @@ void NRed::probePhoenix()
         if (vram != nullptr) { vram->release(); }
     }
 
+    if (complete && checkKernelArgument("-NRedPhoenixPSPRingCreate")) {
+        // First state-changing Phoenix stage. Reserve one 4 KiB page in the
+        // visible VRAM aperture and expose its absolute MC address to PSP's
+        // already-running secure OS as a kernel-mode (GPCOM) ring.
+        static constexpr UInt64 VRAM_BASE = 0x8000000000ULL;
+        static constexpr UInt64 RING_OFFSET = 0x0E000000ULL;
+        static constexpr UInt32 RING_SIZE = 0x1000;
+        static constexpr UInt32 MP0_BASE1 = 0x16000;
+        static constexpr UInt32 C2PMSG_64 = MP0_BASE1 + 0x80;
+        static constexpr UInt32 C2PMSG_67 = MP0_BASE1 + 0x83;
+        static constexpr UInt32 C2PMSG_69 = MP0_BASE1 + 0x85;
+        static constexpr UInt32 C2PMSG_70 = MP0_BASE1 + 0x86;
+        static constexpr UInt32 C2PMSG_71 = MP0_BASE1 + 0x87;
+        static constexpr UInt32 READY_MASK = 0x8000FFFFU;
+        static constexpr UInt32 READY_VALUE = 0x80000000U;
+        static constexpr UInt32 KM_RING_COMMAND = 2U << 16;
+        auto* const ringVram = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
+                                                                       kIOMapInhibitCache | kIOMapAnywhere);
+        UInt32 initialMailbox = 0;
+        if (ringVram != nullptr && RING_OFFSET + RING_SIZE <= ringVram->getLength()
+            && read(C2PMSG_64, initialMailbox) && (initialMailbox & READY_MASK) == READY_VALUE) {
+            auto* const ring = reinterpret_cast<volatile UInt32*>(
+                static_cast<UInt8*>(reinterpret_cast<void*>(ringVram->getVirtualAddress())) + RING_OFFSET);
+            for (UInt32 i = 0; i < RING_SIZE / sizeof(UInt32); i += 1) { ring[i] = 0; }
+            OSSynchronizeIO();
+
+            const UInt64 ringAddress = VRAM_BASE + RING_OFFSET;
+            ptr[C2PMSG_69] = static_cast<UInt32>(ringAddress);
+            ptr[C2PMSG_70] = static_cast<UInt32>(ringAddress >> 32);
+            ptr[C2PMSG_71] = RING_SIZE;
+            OSSynchronizeIO();
+            ptr[C2PMSG_64] = KM_RING_COMMAND;
+            OSSynchronizeIO();
+            IOSleep(20);
+
+            UInt32 response = 0;
+            bool created = false;
+            for (UInt32 attempt = 0; attempt < 1000; attempt += 1) {
+                if (read(C2PMSG_64, response) && (response & READY_MASK) == READY_VALUE) {
+                    created = true;
+                    break;
+                }
+                IOSleep(1);
+            }
+            UInt32 writePointer = 0;
+            read(C2PMSG_67, writePointer);
+            this->iGPU->setProperty("NRed,phoenix-psp-ring-created", created);
+            this->setProp32("NRed,phoenix-psp-ring-response", response);
+            this->setProp32("NRed,phoenix-psp-ring-wptr", writePointer);
+            this->setProp32("NRed,phoenix-psp-ring-offset", static_cast<UInt32>(RING_OFFSET));
+            SYSLOG("NRed", "Phoenix PSP KM ring create: address=0x%llX size=0x%X initial=0x%08X response=0x%08X wptr=0x%08X created=%s",
+                   ringAddress, RING_SIZE, initialMailbox, response, writePointer, created ? "true" : "false");
+        }
+        else {
+            this->iGPU->setProperty("NRed,phoenix-psp-ring-created", false);
+            SYSLOG("NRed", "Phoenix PSP KM ring create precondition failed: BAR0=%s length=0x%llX mailbox=0x%08X",
+                   ringVram != nullptr ? "mapped" : "unmapped", ringVram != nullptr ? ringVram->getLength() : 0,
+                   initialMailbox);
+        }
+        if (ringVram != nullptr) { ringVram->release(); }
+    }
+
     if (complete && checkKernelArgument("-NRedPhoenixIPDiscovery")) {
         // AMD's public discovery format places a 10 KiB blob 64 KiB below
         // the end of VRAM when DRIVER_SCRATCH_2 does not provide an override.
