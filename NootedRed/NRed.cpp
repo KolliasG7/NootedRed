@@ -784,6 +784,15 @@ void NRed::probePhoenix()
         static constexpr UInt64 VRAM_BASE = 0x8000000000ULL;
         static constexpr UInt64 TMR_OFFSET = 0x08000000ULL;
         static constexpr UInt32 TMR_SIZE = 0x04000000;
+        // MMHUB's MC_VM_FB_OFFSET probe reports the system-memory base in
+        // 16 MiB units (0x480 on the test Phoenix laptop).
+        // AMDGPU's amdgpu_gmc_vram_pa() converts a VRAM MC address to the
+        // host/system address as:
+        //   mc - vram_start + get_mc_fb_offset()
+        // IOMemoryMap::getPhysicalAddress() is the CPU PCI aperture address,
+        // not the stolen-system-memory address expected by PSP.
+        static constexpr UInt32 MMHUB_BASE1 = 0x1A000;
+        static constexpr UInt32 MMMC_VM_FB_OFFSET = MMHUB_BASE1 + 0x08D7;
         static constexpr UInt64 RING_OFFSET = 0x0E000000ULL;
         static constexpr UInt64 COMMAND_OFFSET = RING_OFFSET + 0x1000;
         static constexpr UInt64 FENCE_OFFSET = RING_OFFSET + 0x2000;
@@ -795,10 +804,11 @@ void NRed::probePhoenix()
         static constexpr UInt32 RESPONSE_DWORD = 864 / sizeof(UInt32);
         auto* const tmrVram = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
                                                                       kIOMapInhibitCache | kIOMapAnywhere);
-        UInt32 writePointer = 0;
+        UInt32 writePointer = 0, mmFbOffset = 0;
         if (tmrVram != nullptr && FENCE_OFFSET + 0x1000 <= tmrVram->getLength()
             && read(C2PMSG_67, writePointer) && writePointer < RING_DWORDS
-            && (writePointer % FRAME_DWORDS) == 0) {
+            && (writePointer % FRAME_DWORDS) == 0
+            && read(MMMC_VM_FB_OFFSET, mmFbOffset)) {
             auto* const base = reinterpret_cast<volatile UInt32*>(tmrVram->getVirtualAddress());
             auto* const ring = base + (RING_OFFSET / sizeof(UInt32));
             auto* const command = base + (COMMAND_OFFSET / sizeof(UInt32));
@@ -808,13 +818,14 @@ void NRed::probePhoenix()
                 fence[i] = 0;
             }
             const UInt64 tmrAddress = VRAM_BASE + TMR_OFFSET;
-            const UInt64 tmrPhysical = static_cast<UInt64>(tmrVram->getPhysicalAddress()) + TMR_OFFSET;
+            const UInt64 systemFbOffset = static_cast<UInt64>(mmFbOffset & 0x00FFFFFFU) << 24;
+            const UInt64 tmrPhysical = systemFbOffset + TMR_OFFSET;
             command[2] = GFX_CMD_ID_SETUP_TMR;
             command[7] = static_cast<UInt32>(tmrAddress);
             command[8] = static_cast<UInt32>(tmrAddress >> 32);
             command[9] = TMR_SIZE;
-            // PSP DMA traverses VFIO's guest IOVA domain. Pass the guest BAR0
-            // physical address rather than the host stolen-memory address.
+            // Pass both the GPU MC address and the actual stolen-memory
+            // system address, matching AMDGPU's non-SR-IOV SETUP_TMR path.
             command[10] = 2; // virt_phy_addr
             command[11] = static_cast<UInt32>(tmrPhysical);
             command[12] = static_cast<UInt32>(tmrPhysical >> 32);
