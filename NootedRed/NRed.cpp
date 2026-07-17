@@ -339,6 +339,53 @@ void NRed::probePhoenix()
         }
     }
 
+    if (complete && checkKernelArgument("-NRedPhoenixVRAMAliasTest")) {
+        // Reversible one-DWORD test in an otherwise unused part of the visible
+        // BAR0 aperture. This establishes whether PSP/GPU physical addresses
+        // use a VRAM-relative offset or MMHUB's programmed FB base.
+        static constexpr UInt64 TEST_OFFSET = 0x0F000000ULL;
+        static constexpr UInt64 MMHUB_FB_BASE = 0x8000000000ULL;
+        static constexpr UInt32 MM_INDEX = 0x0;
+        static constexpr UInt32 MM_DATA = 0x1;
+        static constexpr UInt32 MM_INDEX_HI = 0x6;
+        auto* const vram = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
+                                                                   kIOMapInhibitCache | kIOMapAnywhere);
+        if (vram != nullptr && TEST_OFFSET + sizeof(UInt32) <= vram->getLength()) {
+            auto* const vramPtr = reinterpret_cast<volatile UInt32*>(vram->getVirtualAddress());
+            const auto indexedRead = [ptr](const UInt64 address) -> UInt32 {
+                ptr[MM_INDEX] = static_cast<UInt32>(address) | 0x80000000U;
+                ptr[MM_INDEX_HI] = static_cast<UInt32>(address >> 31);
+                OSSynchronizeIO();
+                return ptr[MM_DATA];
+            };
+            const size_t testIndex = static_cast<size_t>(TEST_OFFSET / sizeof(UInt32));
+            const UInt32 saved = vramPtr[testIndex];
+            const UInt32 marker = saved ^ 0x4E526564U;
+            vramPtr[testIndex] = marker;
+            OSSynchronizeIO();
+            const UInt32 relativeRead = indexedRead(TEST_OFFSET);
+            const UInt32 absoluteRead = indexedRead(MMHUB_FB_BASE + TEST_OFFSET);
+            vramPtr[testIndex] = saved;
+            OSSynchronizeIO();
+            const UInt32 restored = vramPtr[testIndex];
+            const bool relativeAlias = relativeRead == marker;
+            const bool absoluteAlias = absoluteRead == marker;
+            const bool restoreValid = restored == saved;
+            this->iGPU->setProperty("NRed,phoenix-vram-relative-alias", relativeAlias);
+            this->iGPU->setProperty("NRed,phoenix-vram-absolute-alias", absoluteAlias);
+            this->iGPU->setProperty("NRed,phoenix-vram-alias-restored", restoreValid);
+            this->setProp32("NRed,phoenix-vram-alias-offset", static_cast<UInt32>(TEST_OFFSET));
+            SYSLOG("NRed", "Phoenix VRAM alias test: offset=0x%08X saved=0x%08X relative=0x%08X absolute=0x%08X restored=%s alias=[relative:%s absolute:%s]",
+                   static_cast<UInt32>(TEST_OFFSET), saved, relativeRead, absoluteRead,
+                   restoreValid ? "true" : "false", relativeAlias ? "true" : "false",
+                   absoluteAlias ? "true" : "false");
+        }
+        else {
+            SYSLOG("NRed", "Phoenix VRAM alias test could not map BAR0 offset 0x%llX", TEST_OFFSET);
+        }
+        if (vram != nullptr) { vram->release(); }
+    }
+
     if (complete && checkKernelArgument("-NRedPhoenixIPDiscovery")) {
         // AMD's public discovery format places a 10 KiB blob 64 KiB below
         // the end of VRAM when DRIVER_SCRATCH_2 does not provide an override.
