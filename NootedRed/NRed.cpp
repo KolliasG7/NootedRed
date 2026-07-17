@@ -62,6 +62,11 @@ void NRed::init()
         [](void* const, KernelPatcher& patcher)
         {
             singleton().processPatcher();
+            if (singleton().getAttributes().isPhoenix()) {
+                singleton().probePhoenix();
+                SYSLOG("NRed", "Phoenix probe mode active; incompatible GFX9 driver injection is disabled");
+                return;
+            }
             iVega::DriverInjector::singleton().processPatcher(patcher);
             PenguinWizardry::RuntimeMCManager::singleton().processPatcher(patcher);
         },
@@ -71,6 +76,7 @@ void NRed::init()
         nullptr, 0,
         [](void* const, KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
         {
+            if (singleton().getAttributes().isPhoenix()) { return; }
             Hotfixes::AGDP::singleton().processKext(patcher, id, slide, size);
             Hotfixes::X6000FB::singleton().processKext(patcher, id, slide, size);
             Backlight::singleton().processKext(patcher, id, slide, size);
@@ -180,6 +186,13 @@ void NRed::processPatcher()
             this->attributes.setGreenSardine();
             this->enumRevision = 0xA1;
         } break;
+        case 0x15BF: {
+            // Phoenix1 / Radeon 780M (GFX11.0.3). Do not route this through
+            // the GFX9 Vega implementation: its register maps, firmware and
+            // display engine are incompatible. Probe mode gathers the PCI
+            // topology needed for a dedicated bring-up path.
+            this->attributes.setPhoenix();
+        } break;
         default: PANIC("NRed", "Unknown device ID: 0x%X", this->deviceID);
     }
     this->pciRevision = static_cast<UInt8>(WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigRevisionID));
@@ -195,6 +208,79 @@ void NRed::processPatcher()
     }
 
     DeviceInfo::deleter(devInfo);
+}
+
+void NRed::probePhoenix()
+{
+    static constexpr char model[] = "AMD Radeon 780M (Phoenix experimental probe)";
+    static constexpr char architecture[] = "GFX11.0.3";
+    static constexpr UInt8 probeVersion = 2;
+
+    this->iGPU->setProperty("model", model, sizeof(model));
+    this->iGPU->setProperty("NRed,phoenix-probe", &probeVersion, sizeof(probeVersion));
+    this->iGPU->setProperty("NRed,phoenix-architecture", architecture, sizeof(architecture));
+
+    SYSLOG("NRed", "Phoenix1 detected: device=0x%04X revision=0x%02X", this->deviceID, this->pciRevision);
+    for (UInt8 bar = 0; bar < 6; bar += 1) {
+        const auto reg = static_cast<UInt8>(kIOPCIConfigBaseAddress0 + (bar * sizeof(UInt32)));
+        const auto value = WIOKit::readPCIConfigValue(this->iGPU, reg);
+        SYSLOG("NRed", "Phoenix PCI BAR%u = 0x%08X", bar, value);
+    }
+
+    if (!checkKernelArgument("-NRedPhoenixMMIOProbe")) {
+        SYSLOG("NRed", "Phoenix MMIO probe disabled; use -NRedPhoenixMMIOProbe to enable read-only discovery reads");
+        SYSLOG("NRed", "Phoenix acceleration remains disabled until a GFX11 driver path is available");
+        return;
+    }
+
+    // These DWORD offsets are defined by AMDGPU as consistent across all
+    // supported SoCs.  Keep this stage strictly read-only: no reset, firmware,
+    // VM, interrupt, or ring register may be touched from probe mode.
+    static constexpr UInt32 IP_DISCOVERY_VERSION = 0x16A00;
+    static constexpr UInt32 RCC_CONFIG_MEMSIZE   = 0xDE3;
+    static constexpr UInt32 DRIVER_SCRATCH_0     = 0x94;
+    static constexpr UInt32 DRIVER_SCRATCH_1     = 0x95;
+    static constexpr UInt32 DRIVER_SCRATCH_2     = 0x96;
+
+    auto* const mmio = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5,
+                                                               kIOMapInhibitCache | kIOMapAnywhere);
+    if (mmio == nullptr) {
+        SYSLOG("NRed", "Phoenix read-only MMIO probe could not map BAR5");
+        return;
+    }
+    if (mmio->getLength() == 0) {
+        SYSLOG("NRed", "Phoenix read-only MMIO probe mapped an empty BAR5");
+        mmio->release();
+        return;
+    }
+
+    const auto* const ptr = reinterpret_cast<volatile const UInt32*>(mmio->getVirtualAddress());
+    const auto read = [mmio, ptr](const UInt32 reg, UInt32& value) -> bool {
+        if ((static_cast<UInt64>(reg) * sizeof(UInt32)) >= mmio->getLength()) { return false; }
+        value = ptr[reg];
+        return true;
+    };
+
+    UInt32 discoveryVersion = 0, vramSizeMiB = 0, scratch0 = 0, scratch1 = 0, scratch2 = 0;
+    const bool complete = read(IP_DISCOVERY_VERSION, discoveryVersion) && read(RCC_CONFIG_MEMSIZE, vramSizeMiB)
+                       && read(DRIVER_SCRATCH_0, scratch0) && read(DRIVER_SCRATCH_1, scratch1)
+                       && read(DRIVER_SCRATCH_2, scratch2);
+    if (complete) {
+        SYSLOG("NRed", "Phoenix discovery: version=%u VRAM=%u MiB scratch=[0x%08X 0x%08X 0x%08X]",
+               discoveryVersion, vramSizeMiB, scratch0, scratch1, scratch2);
+        this->setProp32("NRed,phoenix-ip-discovery-version", discoveryVersion);
+        this->setProp32("NRed,phoenix-vram-size-mib", vramSizeMiB);
+        this->setProp32("NRed,phoenix-discovery-scratch0", scratch0);
+        this->setProp32("NRed,phoenix-discovery-scratch1", scratch1);
+        this->setProp32("NRed,phoenix-discovery-scratch2", scratch2);
+    }
+    else {
+        SYSLOG("NRed", "Phoenix BAR5 is too small for the read-only discovery probe (length=0x%llX)",
+               mmio->getLength());
+    }
+    mmio->release();
+
+    SYSLOG("NRed", "Phoenix acceleration remains disabled until a GFX11 driver path is available");
 }
 
 void NRed::setProp32(const char* const key, const UInt32 value) const { this->iGPU->setProperty(key, value, 32); }

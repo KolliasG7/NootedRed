@@ -19,6 +19,7 @@ class NRed
         static constexpr UInt8 IsRenoir       = getBit(2);
         static constexpr UInt8 IsRenoirE      = getBit(3);
         static constexpr UInt8 IsGreenSardine = getBit(4);
+        static constexpr UInt8 IsPhoenix      = getBit(5);
 
         UInt8 value{0};
 
@@ -28,12 +29,14 @@ class NRed
         constexpr bool isRenoir() const { return (this->value & IsRenoir) != 0; }
         constexpr bool isRenoirE() const { return (this->value & IsRenoirE) != 0; }
         constexpr bool isGreenSardine() const { return (this->value & IsGreenSardine) != 0; }
+        constexpr bool isPhoenix() const { return (this->value & IsPhoenix) != 0; }
 
         constexpr void setPicasso() { this->value |= IsPicasso; }
         constexpr void setRaven2() { this->value |= IsRaven2; }
         constexpr void setRenoir() { this->value |= IsRenoir; }
         constexpr void setRenoirE() { this->value |= IsRenoirE; }
         constexpr void setGreenSardine() { this->value |= IsGreenSardine; }
+        constexpr void setPhoenix() { this->value |= IsPhoenix; }
     };
 
     Attributes       attributes;            // TODO: Remove!
@@ -60,6 +63,7 @@ public:
     void init();
     void hwLateInit();        // TODO: Remove!
     void processPatcher();    // TODO: Remove!
+    void probePhoenix();
 
     void              setProp32(const char* key, UInt32 value) const;    // TODO: Remove!
     UInt32            readReg32(UInt32 reg) const;                       // TODO: Remove!
