@@ -551,7 +551,6 @@ void NRed::probePhoenix()
         // Reserve Phoenix's TOC-sized 64 MiB Trusted Memory Region. Native
         // Linux selects offset 0x18000000; it is naturally 64 MiB aligned.
         static constexpr UInt64 VRAM_BASE = 0x8000000000ULL;
-        static constexpr UInt64 VRAM_PHYSICAL_OFFSET = 0x480000000ULL;
         static constexpr UInt64 TMR_OFFSET = 0x18000000ULL;
         static constexpr UInt32 TMR_SIZE = 0x04000000;
         static constexpr UInt64 RING_OFFSET = 0x0E000000ULL;
@@ -578,17 +577,16 @@ void NRed::probePhoenix()
                 fence[i] = 0;
             }
             const UInt64 tmrAddress = VRAM_BASE + TMR_OFFSET;
-            const UInt64 tmrPhysical = VRAM_PHYSICAL_OFFSET + TMR_OFFSET;
+            const UInt64 tmrPhysical = static_cast<UInt64>(tmrVram->getPhysicalAddress()) + TMR_OFFSET;
             command[2] = GFX_CMD_ID_SETUP_TMR;
             command[7] = static_cast<UInt32>(tmrAddress);
             command[8] = static_cast<UInt32>(tmrAddress >> 32);
             command[9] = TMR_SIZE;
-            // VFIO does not expose the host stolen-memory physical address to
-            // the guest IOMMU. Supply only the valid GPU MC address; PSP can
-            // resolve the VRAM backing internally.
-            command[10] = 0;
-            command[11] = 0;
-            command[12] = 0;
+            // PSP DMA traverses VFIO's guest IOVA domain. Pass the guest BAR0
+            // physical address rather than the host stolen-memory address.
+            command[10] = 2; // virt_phy_addr
+            command[11] = static_cast<UInt32>(tmrPhysical);
+            command[12] = static_cast<UInt32>(tmrPhysical >> 32);
 
             auto* const frame = ring + writePointer;
             for (UInt32 i = 0; i < FRAME_DWORDS; i += 1) { frame[i] = 0; }
@@ -616,7 +614,8 @@ void NRed::probePhoenix()
             this->setProp32("NRed,phoenix-psp-tmr-status", status);
             this->setProp32("NRed,phoenix-psp-tmr-fence", fence[0]);
             this->setProp32("NRed,phoenix-psp-tmr-offset", static_cast<UInt32>(TMR_OFFSET));
-            this->iGPU->setProperty("NRed,phoenix-psp-tmr-virtual-only", true);
+            this->setProp32("NRed,phoenix-psp-tmr-physical-low", static_cast<UInt32>(tmrPhysical));
+            this->setProp32("NRed,phoenix-psp-tmr-physical-high", static_cast<UInt32>(tmrPhysical >> 32));
             SYSLOG("NRed", "Phoenix PSP TMR setup: mc=0x%llX pa=0x%llX size=0x%X fence=0x%08X status=0x%08X setup=%s",
                    tmrAddress, tmrPhysical, TMR_SIZE, fence[0], status, setup ? "true" : "false");
         }
