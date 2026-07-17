@@ -317,8 +317,11 @@ void NRed::probePhoenix()
             };
             const UInt16 major = read16(4);
             const UInt16 minor = read16(6);
+            const UInt16 expectedChecksum = read16(8);
             const UInt16 binarySize = read16(10);
-            const UInt16 tableCount = read16(12);
+            const UInt16 tableCount = major >= 2 ? read16(12) : 6;
+            const size_t tableListOffset = major >= 2 ? 16 : 12;
+            const UInt16 ipTableOffset = read16(tableListOffset);
 
             SYSLOG("NRed", "Phoenix IP discovery header: signature=0x%08X version=%u.%u size=%u tables=%u",
                    header[0], major, minor, binarySize, tableCount);
@@ -327,7 +330,111 @@ void NRed::probePhoenix()
             this->setProp32("NRed,phoenix-discovery-minor", minor);
             this->setProp32("NRed,phoenix-discovery-size", binarySize);
             this->setProp32("NRed,phoenix-discovery-table-count", tableCount);
+            this->setProp32("NRed,phoenix-ip-table-offset", ipTableOffset);
             this->iGPU->setProperty("NRed,phoenix-discovery-header-valid", header[0] == BINARY_SIGNATURE);
+
+            if (header[0] == BINARY_SIGNATURE && binarySize >= 20 && binarySize <= (10U << 10)
+                && ipTableOffset < binarySize)
+            {
+                auto* const blob = IONew(UInt8, binarySize);
+                if (blob == nullptr) {
+                    SYSLOG("NRed", "Phoenix could not allocate %u bytes for IP discovery", binarySize);
+                }
+                else {
+                    for (UInt32 offset = 0; offset < binarySize; offset += sizeof(UInt32)) {
+                        const UInt64 position = discoveryOffset + offset;
+                        const UInt32 high = static_cast<UInt32>(position >> 31);
+                        ptr[MM_INDEX] = static_cast<UInt32>(position) | 0x80000000U;
+                        if (high != currentHigh) {
+                            ptr[MM_INDEX_HI] = high;
+                            currentHigh = high;
+                        }
+                        OSSynchronizeIO();
+                        const UInt32 value = ptr[MM_DATA];
+                        for (UInt32 byte = 0; byte < sizeof(UInt32) && (offset + byte) < binarySize; byte += 1) {
+                            blob[offset + byte] = static_cast<UInt8>(value >> (byte * 8));
+                        }
+                    }
+
+                    UInt16 calculatedChecksum = 0;
+                    for (UInt32 offset = 10; offset < binarySize; offset += 1) {
+                        calculatedChecksum = static_cast<UInt16>(calculatedChecksum + blob[offset]);
+                    }
+                    const bool checksumValid = calculatedChecksum == expectedChecksum;
+                    this->iGPU->setProperty("NRed,phoenix-discovery-checksum-valid", checksumValid);
+                    SYSLOG("NRed", "Phoenix discovery checksum: calculated=0x%04X expected=0x%04X valid=%s",
+                           calculatedChecksum, expectedChecksum, checksumValid ? "true" : "false");
+
+                    const auto blob16 = [blob, binarySize](const size_t offset, UInt16& value) -> bool {
+                        if ((offset + 2) > binarySize) { return false; }
+                        value = static_cast<UInt16>(blob[offset])
+                              | static_cast<UInt16>(static_cast<UInt16>(blob[offset + 1]) << 8);
+                        return true;
+                    };
+                    const auto blob32 = [blob, binarySize](const size_t offset, UInt32& value) -> bool {
+                        if ((offset + 4) > binarySize) { return false; }
+                        value = static_cast<UInt32>(blob[offset])
+                              | (static_cast<UInt32>(blob[offset + 1]) << 8)
+                              | (static_cast<UInt32>(blob[offset + 2]) << 16)
+                              | (static_cast<UInt32>(blob[offset + 3]) << 24);
+                        return true;
+                    };
+
+                    UInt32 ipSignature = 0, ipTableID = 0;
+                    UInt16 ipVersion = 0, ipSize = 0, dieCount = 0;
+                    const bool ipHeaderValid = blob32(ipTableOffset, ipSignature)
+                                            && blob16(ipTableOffset + 4, ipVersion)
+                                            && blob16(ipTableOffset + 6, ipSize)
+                                            && blob32(ipTableOffset + 8, ipTableID)
+                                            && blob16(ipTableOffset + 12, dieCount)
+                                            && ipSignature == 0x53445049U
+                                            && ipSize >= 80
+                                            && (static_cast<UInt32>(ipTableOffset) + ipSize) <= binarySize;
+                    this->iGPU->setProperty("NRed,phoenix-ip-table-valid", ipHeaderValid);
+                    this->setProp32("NRed,phoenix-ip-table-version", ipVersion);
+                    this->setProp32("NRed,phoenix-ip-table-size", ipSize);
+                    this->setProp32("NRed,phoenix-ip-table-die-count", dieCount);
+                    SYSLOG("NRed", "Phoenix IP table: signature=0x%08X version=%u size=%u id=0x%08X dies=%u valid=%s",
+                           ipSignature, ipVersion, ipSize, ipTableID, dieCount, ipHeaderValid ? "true" : "false");
+
+                    if (ipHeaderValid && dieCount > 0 && dieCount <= 16) {
+                        UInt16 dieOffset = 0, ipCount = 0;
+                        // die_info starts at byte 14; the first die_offset is
+                        // its second UInt16 and is relative to the binary.
+                        if (blob16(ipTableOffset + 16, dieOffset) && blob16(dieOffset + 2, ipCount)) {
+                            this->setProp32("NRed,phoenix-ip-count", ipCount);
+                            size_t ipOffset = static_cast<size_t>(dieOffset) + 4;
+                            const bool addresses64Bit = ipVersion == 4 && (blob[ipTableOffset + 78] & 1U) != 0;
+                            const size_t addressSize = addresses64Bit ? sizeof(UInt64) : sizeof(UInt32);
+                            for (UInt16 i = 0; i < ipCount && (ipOffset + 8) <= binarySize; i += 1) {
+                                UInt16 hwID = 0;
+                                if (!blob16(ipOffset, hwID)) { break; }
+                                const UInt8 instance = blob[ipOffset + 2];
+                                const UInt8 baseCount = blob[ipOffset + 3];
+                                const UInt8 ipMajor = blob[ipOffset + 4];
+                                const UInt8 ipMinor = blob[ipOffset + 5];
+                                const UInt8 ipRevision = blob[ipOffset + 6];
+                                const size_t nextOffset = ipOffset + 8 + (static_cast<size_t>(baseCount) * addressSize);
+                                if (nextOffset > binarySize) { break; }
+
+                                UInt32 base0 = 0;
+                                if (baseCount > 0) { blob32(ipOffset + 8, base0); }
+                                const UInt32 version = (static_cast<UInt32>(ipMajor) << 16)
+                                                     | (static_cast<UInt32>(ipMinor) << 8) | ipRevision;
+                                char versionKey[48], baseKey[48];
+                                snprintf(versionKey, sizeof(versionKey), "NRed,phoenix-ip-%u-%u-version", hwID, instance);
+                                snprintf(baseKey, sizeof(baseKey), "NRed,phoenix-ip-%u-%u-base0", hwID, instance);
+                                this->setProp32(versionKey, version);
+                                this->setProp32(baseKey, base0);
+                                SYSLOG("NRed", "Phoenix IP[%u]: hw=%u instance=%u version=%u.%u.%u bases=%u base0=0x%08X",
+                                       i, hwID, instance, ipMajor, ipMinor, ipRevision, baseCount, base0);
+                                ipOffset = nextOffset;
+                            }
+                        }
+                    }
+                    IODelete(blob, UInt8, binarySize);
+                }
+            }
         }
         else {
             SYSLOG("NRed", "Phoenix IP discovery skipped because VRAM size is smaller than its reserved offset");
