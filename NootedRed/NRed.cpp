@@ -340,6 +340,49 @@ void NRed::probePhoenix()
         }
     }
 
+    if (complete && checkKernelArgument("-NRedPhoenixSMUDisallowGFXOff")) {
+        // Phoenix MP1 13.0.4 exposes the standard v1 SMU mailbox at IP
+        // discovery segment 1 (0x16000): message C2PMSG_66, argument
+        // C2PMSG_82, and response C2PMSG_90.  Validate that PMFW is alive
+        // with the read-only version command before changing GFXOFF state.
+        // Message IDs are from AMD's public smu_v13_0_4_ppsmc interface.
+        static constexpr UInt32 MP1_BASE1 = 0x16000;
+        static constexpr UInt32 C2PMSG_66 = MP1_BASE1 + 0x282;
+        static constexpr UInt32 C2PMSG_82 = MP1_BASE1 + 0x292;
+        static constexpr UInt32 C2PMSG_90 = MP1_BASE1 + 0x29A;
+        static constexpr UInt32 PPSMC_MSG_GET_PMFW_VERSION = 0x02;
+        static constexpr UInt32 PPSMC_MSG_DISALLOW_GFXOFF = 0x1A;
+
+        UInt32 initialMsg = 0, initialArg = 0, initialResp = 0;
+        read(C2PMSG_66, initialMsg);
+        read(C2PMSG_82, initialArg);
+        read(C2PMSG_90, initialResp);
+        this->setProp32("NRed,phoenix-smu-initial-message", initialMsg);
+        this->setProp32("NRed,phoenix-smu-initial-argument", initialArg);
+        this->setProp32("NRed,phoenix-smu-initial-response", initialResp);
+
+        UInt32 pmfwVersion = 0;
+        const auto versionResult = this->sendMsgToSmc(PPSMC_MSG_GET_PMFW_VERSION, 0, &pmfwVersion);
+        const UInt32 versionResp = ptr[C2PMSG_90];
+        this->setProp32("NRed,phoenix-smu-pmfw-version", pmfwVersion);
+        this->setProp32("NRed,phoenix-smu-version-response", versionResp);
+        this->setProp32("NRed,phoenix-smu-version-result", static_cast<UInt32>(versionResult));
+
+        CAILResult gfxOffResult = kCAILResultNoResponse;
+        UInt32 gfxOffResp = 0;
+        if (versionResult == kCAILResultOK && versionResp == kSMUFWResponseSuccess) {
+            gfxOffResult = this->sendMsgToSmc(PPSMC_MSG_DISALLOW_GFXOFF);
+            gfxOffResp = ptr[C2PMSG_90];
+        }
+        this->setProp32("NRed,phoenix-smu-disallow-gfxoff-response", gfxOffResp);
+        this->setProp32("NRed,phoenix-smu-disallow-gfxoff-result", static_cast<UInt32>(gfxOffResult));
+        this->iGPU->setProperty("NRed,phoenix-smu-gfxoff-disallowed",
+                               gfxOffResult == kCAILResultOK && gfxOffResp == kSMUFWResponseSuccess);
+        SYSLOG("NRed", "Phoenix SMU: initial msg=0x%08X arg=0x%08X resp=0x%08X PMFW=0x%08X versionResp=0x%08X versionResult=%u DisallowGfxOff resp=0x%08X result=%u",
+               initialMsg, initialArg, initialResp, pmfwVersion, versionResp,
+               static_cast<UInt32>(versionResult), gfxOffResp, static_cast<UInt32>(gfxOffResult));
+    }
+
     if (complete && checkKernelArgument("-NRedPhoenixGFXHUBInit")) {
         // Passthrough did not execute enough of the platform POST to populate
         // GFXHUB's FB copy registers. Mirror MMHUB's validated 512 MiB window.
