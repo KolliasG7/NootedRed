@@ -26,6 +26,7 @@
 #include <PenguinWizardry/RuntimeMC.hpp>
 #include <PhoenixFirmwareSDMA.hpp>
 #include <PhoenixFirmwareIMU.hpp>
+#include <PhoenixFirmwareGFX.hpp>
 #include <iVega/AppleGFXHDA.hpp>
 #include <iVega/DriverInjector.hpp>
 #include <iVega/HWLibs.hpp>
@@ -778,6 +779,7 @@ void NRed::probePhoenix()
         if (queryVram != nullptr) { queryVram->release(); }
     }
 
+    bool phoenixPSPTMRReady = false;
     if (complete && checkKernelArgument("-NRedPhoenixPSPTMRSetup")) {
         // Reserve Phoenix's TOC-sized 64 MiB Trusted Memory Region. Keep it
         // naturally aligned and inside VFIO's visible 256 MiB BAR0 aperture.
@@ -852,6 +854,7 @@ void NRed::probePhoenix()
             }
             const UInt32 status = command[RESPONSE_DWORD];
             const bool setup = consumed && status == 0;
+            phoenixPSPTMRReady = setup;
             this->iGPU->setProperty("NRed,phoenix-psp-tmr-setup", setup);
             this->setProp32("NRed,phoenix-psp-tmr-status", status);
             this->setProp32("NRed,phoenix-psp-tmr-fence", fence[0]);
@@ -960,6 +963,152 @@ void NRed::probePhoenix()
         SYSLOG("NRed", "Phoenix SDMA firmware PSP submission: image=%s ctx=[consumed:%s status:0x%08X] ctl=[consumed:%s status:0x%08X] loaded=%s",
                imageValid ? "valid" : "invalid", ctxConsumed ? "true" : "false", ctxStatus,
                ctlConsumed ? "true" : "false", ctlStatus, loaded ? "true" : "false");
+        if (fwVram != nullptr) { fwVram->release(); }
+    }
+
+    if (complete && checkKernelArgument("-NRedPhoenixPSPAutoload")) {
+        // PSP firmware loading is the only remaining initialization route
+        // that does not release IMU reset directly or send EnableGfxImu to
+        // the physical APU's shared PMFW mailbox. Mirror AMDGPU_FW_LOAD_PSP:
+        // submit every graphics payload in ucode-ID order, then ask PSP to
+        // perform its authenticated RLC autoload after RLC_G is accepted.
+        static constexpr UInt64 VRAM_BASE = 0x8000000000ULL;
+        static constexpr UInt64 RING_OFFSET = 0x0E000000ULL;
+        static constexpr UInt64 COMMAND_OFFSET = RING_OFFSET + 0x1000;
+        static constexpr UInt64 FENCE_OFFSET = RING_OFFSET + 0x2000;
+        static constexpr UInt64 FIRMWARE_OFFSET = 0x0E100000ULL;
+        static constexpr UInt32 MP0_BASE1 = 0x16000;
+        static constexpr UInt32 C2PMSG_67 = MP0_BASE1 + 0x83;
+        static constexpr UInt32 GFX_CMD_ID_LOAD_IP_FW = 0x6;
+        static constexpr UInt32 GFX_CMD_ID_AUTOLOAD_RLC = 0x21;
+        static constexpr UInt32 FRAME_DWORDS = 16;
+        static constexpr UInt32 RING_DWORDS = 0x1000 / sizeof(UInt32);
+        static constexpr UInt32 RESPONSE_DWORD = 864 / sizeof(UInt32);
+
+        struct FirmwarePart {
+            const UInt8* payload;
+            UInt32 size;
+            UInt32 type;
+            const char* name;
+        };
+        // Values below are fields from the unmodified AMD firmware headers.
+        // The bounds checks against each complete image prevent a malformed
+        // or mismatched artifact from reaching PSP.
+        const FirmwarePart parts[] {
+            {phoenix_sdma_6_0_1 + 0x100, 0x4400, 71, "SDMA_TH0"},
+            {phoenix_sdma_6_0_1 + 0x4500, 0x4200, 72, "SDMA_TH1"},
+            {phoenix_gc_11_0_1_pfp + 0x100, 0x40400, 2, "CP_PFP"},
+            {phoenix_gc_11_0_1_me + 0x100, 0x40400, 1, "CP_ME"},
+            {phoenix_gc_11_0_1_mec + 0x100, 0x41300, 4, "CP_MEC"},
+            {phoenix_gc_11_0_1_imu + 0x100, 0x10200, 68, "IMU_I"},
+            {phoenix_gc_11_0_1_imu + 0x10300, 0x10200, 69, "IMU_D"},
+            {phoenix_gc_11_0_1_rlc + 0x6300, 0x0A00, 20, "RLC_GPM_RESTORE"},
+            {phoenix_gc_11_0_1_rlc + 0x6D00, 0x5270, 21, "RLC_SRM_RESTORE"},
+            {phoenix_gc_11_0_1_rlc + 0xBF70, 0x10200, 26, "RLC_IRAM"},
+            {phoenix_gc_11_0_1_rlc + 0x1C170, 0x8200, 48, "RLC_DRAM"},
+            {phoenix_gc_11_0_1_rlc + 0x24370, 0x2200, 25, "RLC_P"},
+            // RLC_G must remain last: AMDGPU submits AUTOLOAD_RLC after it.
+            {phoenix_gc_11_0_1_rlc + 0x100, 0x6200, 8, "RLC_G"},
+        };
+        const bool imagesValid = phoenix_sdma_6_0_1_len == 0x8700
+                              && phoenix_gc_11_0_1_pfp_len == 0x40500
+                              && phoenix_gc_11_0_1_me_len == 0x40500
+                              && phoenix_gc_11_0_1_mec_len == 0x41780
+                              && phoenix_gc_11_0_1_imu_len == 0x20500
+                              && phoenix_gc_11_0_1_rlc_len == 0x26570;
+        auto* const fwVram = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
+                                                                     kIOMapInhibitCache | kIOMapAnywhere);
+        UInt32 accepted = 0, failedType = 0, failedStatus = ~0U, autoloadStatus = ~0U;
+        bool autoloadConsumed = false;
+        if (phoenixPSPTMRReady && imagesValid && fwVram != nullptr
+            && FIRMWARE_OFFSET + 0x40400 <= fwVram->getLength()) {
+            auto* const base = reinterpret_cast<volatile UInt32*>(fwVram->getVirtualAddress());
+            auto* const bytes = reinterpret_cast<volatile UInt8*>(fwVram->getVirtualAddress());
+            auto* const ring = base + (RING_OFFSET / sizeof(UInt32));
+            auto* const command = base + (COMMAND_OFFSET / sizeof(UInt32));
+            auto* const fence = base + (FENCE_OFFSET / sizeof(UInt32));
+            auto* const staging = bytes + FIRMWARE_OFFSET;
+            const UInt64 commandAddress = VRAM_BASE + COMMAND_OFFSET;
+            const UInt64 fenceAddress = VRAM_BASE + FENCE_OFFSET;
+            const UInt64 firmwareAddress = VRAM_BASE + FIRMWARE_OFFSET;
+
+            const auto submit = [ptr, ring, command, fence, commandAddress, fenceAddress]
+                                (const UInt32 commandID, const UInt64 payloadAddress,
+                                 const UInt32 payloadSize, const UInt32 payloadType,
+                                 const UInt32 fenceValue, UInt32& status) -> bool {
+                for (UInt32 i = 0; i < 0x1000 / sizeof(UInt32); i += 1) {
+                    command[i] = 0;
+                    fence[i] = 0;
+                }
+                command[2] = commandID;
+                if (commandID == GFX_CMD_ID_LOAD_IP_FW) {
+                    command[7] = static_cast<UInt32>(payloadAddress);
+                    command[8] = static_cast<UInt32>(payloadAddress >> 32);
+                    command[9] = payloadSize;
+                    command[10] = payloadType;
+                }
+                const UInt32 writePointer = ptr[C2PMSG_67];
+                if (writePointer >= RING_DWORDS || (writePointer % FRAME_DWORDS) != 0) {
+                    return false;
+                }
+                auto* const frame = ring + writePointer;
+                for (UInt32 i = 0; i < FRAME_DWORDS; i += 1) { frame[i] = 0; }
+                frame[0] = static_cast<UInt32>(commandAddress);
+                frame[1] = static_cast<UInt32>(commandAddress >> 32);
+                frame[3] = static_cast<UInt32>(fenceAddress);
+                frame[4] = static_cast<UInt32>(fenceAddress >> 32);
+                frame[5] = fenceValue;
+                OSSynchronizeIO();
+                ptr[C2PMSG_67] = (writePointer + FRAME_DWORDS) % RING_DWORDS;
+                OSSynchronizeIO();
+                for (UInt32 attempt = 0; attempt < 5000; attempt += 1) {
+                    OSSynchronizeIO();
+                    if (fence[0] == fenceValue) {
+                        status = command[RESPONSE_DWORD];
+                        return true;
+                    }
+                    IOSleep(1);
+                }
+                status = command[RESPONSE_DWORD];
+                return false;
+            };
+
+            for (UInt32 index = 0; index < arrsize(parts); index += 1) {
+                const auto& part = parts[index];
+                for (UInt32 byte = 0; byte < part.size; byte += 1) {
+                    staging[byte] = part.payload[byte];
+                }
+                OSSynchronizeIO();
+                UInt32 status = ~0U;
+                const bool consumed = submit(GFX_CMD_ID_LOAD_IP_FW, firmwareAddress,
+                                             part.size, part.type, 0x100 + index, status);
+                SYSLOG("NRed", "Phoenix PSP firmware %s: type=%u size=0x%X consumed=%s status=0x%08X",
+                       part.name, part.type, part.size, consumed ? "true" : "false", status);
+                if (!consumed || status != 0) {
+                    failedType = part.type;
+                    failedStatus = status;
+                    break;
+                }
+                accepted += 1;
+            }
+            if (accepted == arrsize(parts)) {
+                autoloadConsumed = submit(GFX_CMD_ID_AUTOLOAD_RLC, 0, 0, 0,
+                                          0x100 + arrsize(parts), autoloadStatus);
+            }
+        }
+        const bool submitted = accepted == arrsize(parts)
+                            && autoloadConsumed && autoloadStatus == 0;
+        this->iGPU->setProperty("NRed,phoenix-psp-autoload-images-valid", imagesValid);
+        this->iGPU->setProperty("NRed,phoenix-psp-autoload-submitted", submitted);
+        this->setProp32("NRed,phoenix-psp-autoload-accepted", accepted);
+        this->setProp32("NRed,phoenix-psp-autoload-failed-type", failedType);
+        this->setProp32("NRed,phoenix-psp-autoload-failed-status", failedStatus);
+        this->setProp32("NRed,phoenix-psp-autoload-status", autoloadStatus);
+        SYSLOG("NRed", "Phoenix PSP autoload: TMR=%s images=%s accepted=%u/%zu failed=[type:%u status:0x%08X] autoload=[consumed:%s status:0x%08X] submitted=%s",
+               phoenixPSPTMRReady ? "true" : "false", imagesValid ? "valid" : "invalid",
+               accepted, arrsize(parts), failedType, failedStatus,
+               autoloadConsumed ? "true" : "false", autoloadStatus,
+               submitted ? "true" : "false");
         if (fwVram != nullptr) { fwVram->release(); }
     }
 

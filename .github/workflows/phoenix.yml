@@ -29,10 +29,18 @@ jobs:
             > NootedRed/PhoenixFirmwareSDMAGenerated.hpp
           xxd -i -n phoenix_gc_11_0_1_imu NootedRed/Firmware/gc_11_0_1_imu.bin \
             > NootedRed/PhoenixFirmwareIMUGenerated.hpp
+          : > NootedRed/PhoenixFirmwareGFXGenerated.hpp
+          for component in pfp me mec rlc; do
+            xxd -i -n "phoenix_gc_11_0_1_${component}" \
+              "NootedRed/Firmware/gc_11_0_1_${component}.bin" \
+              >> NootedRed/PhoenixFirmwareGFXGenerated.hpp
+          done
           sed -i '' 's/^unsigned char/static const unsigned char/; s/^unsigned int/static const unsigned int/' \
             NootedRed/PhoenixFirmwareSDMAGenerated.hpp
           sed -i '' 's/^unsigned char/static const unsigned char/; s/^unsigned int/static const unsigned int/' \
             NootedRed/PhoenixFirmwareIMUGenerated.hpp
+          sed -i '' 's/^unsigned char/static const unsigned char/; s/^unsigned int/static const unsigned int/' \
+            NootedRed/PhoenixFirmwareGFXGenerated.hpp
       - name: Build research release
         run: xcodebuild -configuration "Research Release" -arch x86_64 build
       - name: Verify x86_64 kext
