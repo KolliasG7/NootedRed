@@ -23,6 +23,12 @@ jobs:
           ln -s ../MacKernelSDK Lilu/MacKernelSDK
           cd Lilu
           xcodebuild -jobs 1 -configuration Debug -arch x86_64 build
+      - name: Embed AMD Phoenix firmware binary
+        run: |
+          xxd -i -n phoenix_sdma_6_0_1 NootedRed/Firmware/phoenix_sdma_6_0_1.bin \
+            > NootedRed/PhoenixFirmwareSDMAGenerated.hpp
+          sed -i '' 's/^unsigned char/static const unsigned char/; s/^unsigned int/static const unsigned int/' \
+            NootedRed/PhoenixFirmwareSDMAGenerated.hpp
       - name: Build research release
         run: xcodebuild -configuration "Research Release" -arch x86_64 build
       - name: Verify x86_64 kext

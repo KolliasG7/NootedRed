@@ -38,3 +38,4 @@ build/
 **/xcshareddata/WorkspaceSettings.xcsettings
 .cache/
 clang_analyze/
+NootedRed/PhoenixFirmwareSDMAGenerated.hpp

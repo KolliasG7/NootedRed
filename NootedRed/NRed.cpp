@@ -24,6 +24,7 @@
 #include <Kexts.hpp>
 #include <NRed.hpp>
 #include <PenguinWizardry/RuntimeMC.hpp>
+#include <PhoenixFirmwareSDMA.hpp>
 #include <iVega/AppleGFXHDA.hpp>
 #include <iVega/DriverInjector.hpp>
 #include <iVega/HWLibs.hpp>
@@ -621,6 +622,100 @@ void NRed::probePhoenix()
                    tmrVram != nullptr ? "mapped" : "unmapped", writePointer);
         }
         if (tmrVram != nullptr) { tmrVram->release(); }
+    }
+
+    if (complete && checkKernelArgument("-NRedPhoenixSDMAFirmware")) {
+        // Submit AMD's signed SDMA 6.0.1 context/control payloads through the
+        // validated PSP ring. The opaque payload is never interpreted here.
+        static constexpr UInt64 VRAM_BASE = 0x8000000000ULL;
+        static constexpr UInt64 RING_OFFSET = 0x0E000000ULL;
+        static constexpr UInt64 COMMAND_OFFSET = RING_OFFSET + 0x1000;
+        static constexpr UInt64 FENCE_OFFSET = RING_OFFSET + 0x2000;
+        static constexpr UInt64 FIRMWARE_OFFSET = 0x0E100000ULL;
+        static constexpr UInt32 MP0_BASE1 = 0x16000;
+        static constexpr UInt32 C2PMSG_67 = MP0_BASE1 + 0x83;
+        static constexpr UInt32 GFX_CMD_ID_LOAD_IP_FW = 0x6;
+        static constexpr UInt32 GFX_FW_TYPE_SDMA_UCODE_TH0 = 71;
+        static constexpr UInt32 GFX_FW_TYPE_SDMA_UCODE_TH1 = 72;
+        static constexpr UInt32 FRAME_DWORDS = 16;
+        static constexpr UInt32 RING_DWORDS = 0x1000 / sizeof(UInt32);
+        static constexpr UInt32 RESPONSE_DWORD = 864 / sizeof(UInt32);
+        static constexpr UInt32 SDMA_CTX_OFFSET = 0x100;
+        static constexpr UInt32 SDMA_CTX_SIZE = 0x4400;
+        static constexpr UInt32 SDMA_CTL_OFFSET = 0x4500;
+        static constexpr UInt32 SDMA_CTL_SIZE = 0x4200;
+        auto* const fwVram = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
+                                                                     kIOMapInhibitCache | kIOMapAnywhere);
+        const bool imageValid = phoenix_sdma_6_0_1_len == 0x8700
+                             && SDMA_CTX_OFFSET + SDMA_CTX_SIZE <= phoenix_sdma_6_0_1_len
+                             && SDMA_CTL_OFFSET + SDMA_CTL_SIZE <= phoenix_sdma_6_0_1_len;
+        UInt32 ctxStatus = ~0U, ctlStatus = ~0U;
+        bool ctxConsumed = false, ctlConsumed = false;
+        if (fwVram != nullptr && FIRMWARE_OFFSET + SDMA_CTX_SIZE <= fwVram->getLength() && imageValid) {
+            auto* const base = reinterpret_cast<volatile UInt32*>(fwVram->getVirtualAddress());
+            auto* const byteBase = reinterpret_cast<volatile UInt8*>(fwVram->getVirtualAddress());
+            auto* const ring = base + (RING_OFFSET / sizeof(UInt32));
+            auto* const command = base + (COMMAND_OFFSET / sizeof(UInt32));
+            auto* const fence = base + (FENCE_OFFSET / sizeof(UInt32));
+            auto* const staging = byteBase + FIRMWARE_OFFSET;
+            const UInt64 commandAddress = VRAM_BASE + COMMAND_OFFSET;
+            const UInt64 fenceAddress = VRAM_BASE + FENCE_OFFSET;
+            const UInt64 firmwareAddress = VRAM_BASE + FIRMWARE_OFFSET;
+
+            const auto submit = [ptr, ring, command, fence, staging, commandAddress, fenceAddress,
+                                 firmwareAddress](const UInt8* const payload, const UInt32 size,
+                                                  const UInt32 type, const UInt32 fenceValue,
+                                                  UInt32& status) -> bool {
+                for (UInt32 i = 0; i < size; i += 1) { staging[i] = payload[i]; }
+                for (UInt32 i = 0; i < 0x1000 / sizeof(UInt32); i += 1) {
+                    command[i] = 0;
+                    fence[i] = 0;
+                }
+                command[2] = GFX_CMD_ID_LOAD_IP_FW;
+                command[7] = static_cast<UInt32>(firmwareAddress);
+                command[8] = static_cast<UInt32>(firmwareAddress >> 32);
+                command[9] = size;
+                command[10] = type;
+
+                const UInt32 writePointer = ptr[C2PMSG_67];
+                if (writePointer >= RING_DWORDS || (writePointer % FRAME_DWORDS) != 0) { return false; }
+                auto* const frame = ring + writePointer;
+                for (UInt32 i = 0; i < FRAME_DWORDS; i += 1) { frame[i] = 0; }
+                frame[0] = static_cast<UInt32>(commandAddress);
+                frame[1] = static_cast<UInt32>(commandAddress >> 32);
+                frame[3] = static_cast<UInt32>(fenceAddress);
+                frame[4] = static_cast<UInt32>(fenceAddress >> 32);
+                frame[5] = fenceValue;
+                OSSynchronizeIO();
+                ptr[C2PMSG_67] = (writePointer + FRAME_DWORDS) % RING_DWORDS;
+                OSSynchronizeIO();
+                for (UInt32 attempt = 0; attempt < 5000; attempt += 1) {
+                    OSSynchronizeIO();
+                    if (fence[0] == fenceValue) {
+                        status = command[RESPONSE_DWORD];
+                        return true;
+                    }
+                    IOSleep(1);
+                }
+                status = command[RESPONSE_DWORD];
+                return false;
+            };
+
+            ctxConsumed = submit(phoenix_sdma_6_0_1 + SDMA_CTX_OFFSET, SDMA_CTX_SIZE,
+                                 GFX_FW_TYPE_SDMA_UCODE_TH0, 3, ctxStatus);
+            if (ctxConsumed && ctxStatus == 0) {
+                ctlConsumed = submit(phoenix_sdma_6_0_1 + SDMA_CTL_OFFSET, SDMA_CTL_SIZE,
+                                     GFX_FW_TYPE_SDMA_UCODE_TH1, 4, ctlStatus);
+            }
+        }
+        const bool loaded = ctxConsumed && ctlConsumed && ctxStatus == 0 && ctlStatus == 0;
+        this->iGPU->setProperty("NRed,phoenix-sdma-firmware-loaded", loaded);
+        this->setProp32("NRed,phoenix-sdma-context-status", ctxStatus);
+        this->setProp32("NRed,phoenix-sdma-control-status", ctlStatus);
+        SYSLOG("NRed", "Phoenix SDMA firmware PSP submission: image=%s ctx=[consumed:%s status:0x%08X] ctl=[consumed:%s status:0x%08X] loaded=%s",
+               imageValid ? "valid" : "invalid", ctxConsumed ? "true" : "false", ctxStatus,
+               ctlConsumed ? "true" : "false", ctlStatus, loaded ? "true" : "false");
+        if (fwVram != nullptr) { fwVram->release(); }
     }
 
     if (complete && checkKernelArgument("-NRedPhoenixIPDiscovery")) {
