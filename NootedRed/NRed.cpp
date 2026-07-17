@@ -340,6 +340,29 @@ void NRed::probePhoenix()
         }
     }
 
+    if (complete && checkKernelArgument("-NRedPhoenixGFXHUBInit")) {
+        // Passthrough did not execute enough of the platform POST to populate
+        // GFXHUB's FB copy registers. Mirror MMHUB's validated 512 MiB window.
+        static constexpr UInt32 GC_BASE0 = 0x1260;
+        static constexpr UInt32 GCMC_VM_FB_LOCATION_BASE = GC_BASE0 + 0x1688;
+        static constexpr UInt32 GCMC_VM_FB_LOCATION_TOP  = GC_BASE0 + 0x1689;
+        static constexpr UInt32 PHOENIX_FB_BASE = 0x8000;
+        static constexpr UInt32 PHOENIX_FB_TOP  = 0x801F;
+        ptr[GCMC_VM_FB_LOCATION_BASE] = PHOENIX_FB_BASE;
+        ptr[GCMC_VM_FB_LOCATION_TOP] = PHOENIX_FB_TOP;
+        OSSynchronizeIO();
+        UInt32 programmedBase = 0, programmedTop = 0;
+        const bool programmed = read(GCMC_VM_FB_LOCATION_BASE, programmedBase)
+                             && read(GCMC_VM_FB_LOCATION_TOP, programmedTop)
+                             && (programmedBase & 0x00FFFFFFU) == PHOENIX_FB_BASE
+                             && (programmedTop & 0x00FFFFFFU) == PHOENIX_FB_TOP;
+        this->iGPU->setProperty("NRed,phoenix-gfxhub-fb-programmed", programmed);
+        this->setProp32("NRed,phoenix-gfxhub-fb-programmed-base", programmedBase);
+        this->setProp32("NRed,phoenix-gfxhub-fb-programmed-top", programmedTop);
+        SYSLOG("NRed", "Phoenix GFXHUB FB window init: base=0x%08X top=0x%08X programmed=%s",
+               programmedBase, programmedTop, programmed ? "true" : "false");
+    }
+
     if (complete && checkKernelArgument("-NRedPhoenixVRAMAliasTest")) {
         // Reversible one-DWORD test in an otherwise unused part of the visible
         // BAR0 aperture. This establishes whether PSP/GPU physical addresses
