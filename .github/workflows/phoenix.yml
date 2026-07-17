@@ -27,8 +27,12 @@ jobs:
         run: |
           xxd -i -n phoenix_sdma_6_0_1 NootedRed/Firmware/phoenix_sdma_6_0_1.bin \
             > NootedRed/PhoenixFirmwareSDMAGenerated.hpp
+          xxd -i -n phoenix_gc_11_0_1_imu NootedRed/Firmware/gc_11_0_1_imu.bin \
+            > NootedRed/PhoenixFirmwareIMUGenerated.hpp
           sed -i '' 's/^unsigned char/static const unsigned char/; s/^unsigned int/static const unsigned int/' \
             NootedRed/PhoenixFirmwareSDMAGenerated.hpp
+          sed -i '' 's/^unsigned char/static const unsigned char/; s/^unsigned int/static const unsigned int/' \
+            NootedRed/PhoenixFirmwareIMUGenerated.hpp
       - name: Build research release
         run: xcodebuild -configuration "Research Release" -arch x86_64 build
       - name: Verify x86_64 kext

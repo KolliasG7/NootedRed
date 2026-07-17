@@ -25,6 +25,7 @@
 #include <NRed.hpp>
 #include <PenguinWizardry/RuntimeMC.hpp>
 #include <PhoenixFirmwareSDMA.hpp>
+#include <PhoenixFirmwareIMU.hpp>
 #include <iVega/AppleGFXHDA.hpp>
 #include <iVega/DriverInjector.hpp>
 #include <iVega/HWLibs.hpp>
@@ -409,6 +410,61 @@ void NRed::probePhoenix()
             SYSLOG("NRed", "Phoenix IMU read-only probe registers exceed BAR5 length=0x%llX",
                    mmio->getLength());
         }
+    }
+
+    if (complete && checkKernelArgument("-NRedPhoenixIMUDirectLoad")) {
+        // Linux's direct GC 11 path loads IMU instruction and data RAM before
+        // releasing reset or asking PMFW to enable GFX IMU. Keep those state
+        // transitions in a later, independently gated stage. This stage only
+        // writes the two opaque AMD firmware payloads and leaves CRESET set.
+        static constexpr UInt32 GC_BASE1 = 0xA000;
+        static constexpr UInt32 GFX_IMU_CORE_CTRL = GC_BASE1 + 0x40B6;
+        static constexpr UInt32 GFX_IMU_D_RAM_ADDR = GC_BASE1 + 0x40FC;
+        static constexpr UInt32 GFX_IMU_D_RAM_DATA = GC_BASE1 + 0x40FD;
+        static constexpr UInt32 GFX_IMU_I_RAM_ADDR = GC_BASE1 + 0x5F90;
+        static constexpr UInt32 GFX_IMU_I_RAM_DATA = GC_BASE1 + 0x5F91;
+        static constexpr UInt32 IMAGE_SIZE = 0x20500;
+        static constexpr UInt32 PAYLOAD_OFFSET = 0x100;
+        static constexpr UInt32 IRAM_SIZE = 0x10200;
+        static constexpr UInt32 DRAM_SIZE = 0x10200;
+        static constexpr UInt32 DRAM_OFFSET = PAYLOAD_OFFSET + IRAM_SIZE;
+        static constexpr UInt32 IMU_VERSION = 0x0B012D00;
+
+        UInt32 coreBefore = 0;
+        const bool imageValid = phoenix_gc_11_0_1_imu_len == IMAGE_SIZE
+                             && DRAM_OFFSET + DRAM_SIZE <= phoenix_gc_11_0_1_imu_len;
+        const bool cleanReset = read(GFX_IMU_CORE_CTRL, coreBefore) && (coreBefore & 1U) != 0;
+        bool loaded = false;
+        UInt32 iAddr = ~0U, dAddr = ~0U, coreAfter = ~0U;
+        if (imageValid && cleanReset) {
+            ptr[GFX_IMU_I_RAM_ADDR] = 0;
+            for (UInt32 offset = 0; offset < IRAM_SIZE; offset += sizeof(UInt32)) {
+                UInt32 word = 0;
+                memcpy(&word, phoenix_gc_11_0_1_imu + PAYLOAD_OFFSET + offset, sizeof(word));
+                ptr[GFX_IMU_I_RAM_DATA] = word;
+            }
+            ptr[GFX_IMU_I_RAM_ADDR] = IMU_VERSION;
+
+            ptr[GFX_IMU_D_RAM_ADDR] = 0;
+            for (UInt32 offset = 0; offset < DRAM_SIZE; offset += sizeof(UInt32)) {
+                UInt32 word = 0;
+                memcpy(&word, phoenix_gc_11_0_1_imu + DRAM_OFFSET + offset, sizeof(word));
+                ptr[GFX_IMU_D_RAM_DATA] = word;
+            }
+            ptr[GFX_IMU_D_RAM_ADDR] = IMU_VERSION;
+            OSSynchronizeIO();
+            loaded = read(GFX_IMU_I_RAM_ADDR, iAddr) && read(GFX_IMU_D_RAM_ADDR, dAddr)
+                  && read(GFX_IMU_CORE_CTRL, coreAfter)
+                  && iAddr == IMU_VERSION && dAddr == IMU_VERSION && (coreAfter & 1U) != 0;
+        }
+        this->iGPU->setProperty("NRed,phoenix-imu-direct-loaded", loaded);
+        this->setProp32("NRed,phoenix-imu-direct-i-addr", iAddr);
+        this->setProp32("NRed,phoenix-imu-direct-d-addr", dAddr);
+        this->setProp32("NRed,phoenix-imu-direct-core-before", coreBefore);
+        this->setProp32("NRed,phoenix-imu-direct-core-after", coreAfter);
+        SYSLOG("NRed", "Phoenix IMU direct load: image=%s cleanReset=%s IAddr=0x%08X DAddr=0x%08X core=[0x%08X->0x%08X] loaded=%s",
+               imageValid ? "valid" : "invalid", cleanReset ? "true" : "false", iAddr, dAddr,
+               coreBefore, coreAfter, loaded ? "true" : "false");
     }
 
     if (complete && checkKernelArgument("-NRedPhoenixGFXHUBInit")) {
